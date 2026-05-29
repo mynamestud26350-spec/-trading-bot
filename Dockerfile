@@ -5,8 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot_webhook.py .
+COPY bot.py .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD exec gunicorn bot_webhook:app --bind 0.0.0.0:$PORT
+CMD exec gunicorn bot:app --bind 0.0.0.0:$PORT
