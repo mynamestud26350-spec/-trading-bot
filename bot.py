@@ -15,11 +15,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========== НАСТРОЙКИ ==========
-TOKEN = os.getenv("TELEGRAM_TOKEN", "7852603191:AAE08Eqz8WNc9UD4_ZyM8YS7GmIw1jcgad4")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "UhHGm6bB5zG90miFkG")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "3V7vA1K4hPnVvu8MkOatQGdL6xFneKD5BRHT")
+# ========== НАСТРОЙКИ (берутся из переменных окружения) ==========
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 ALLOWED_USER_IDS = list(map(int, os.getenv("ALLOWED_USER_IDS", "").split(","))) if os.getenv("ALLOWED_USER_IDS") else []
+
+if not TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN не найден")
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    raise ValueError("❌ BYBIT ключи не найдены")
 
 # ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -30,19 +35,6 @@ app = Flask(__name__)
 
 # ========== ФЛАГ АВТОТОРГОВЛИ ==========
 auto_trade_active = [True]
-
-# ========== ЗАЩИТА ==========
-def is_allowed(user_id):
-    if not ALLOWED_USER_IDS:
-        return True
-    return user_id in ALLOWED_USER_IDS
-
-def check_access(call_or_message):
-    uid = call_or_message.from_user.id if hasattr(call_or_message, 'from_user') else call_or_message.chat.id
-    if not is_allowed(uid):
-        logger.warning(f"⛔ Попытка доступа от незнакомого пользователя: {uid}")
-        return False
-    return True
 
 # ========== БАЗА ДАННЫХ ==========
 DB_PATH = 'trades.db'
@@ -64,6 +56,8 @@ def init_db():
             status TEXT
         )
     ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_status ON trades(ticker, status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp)')
     conn.commit()
     conn.close()
     logger.info("✅ База данных инициализирована")
@@ -123,6 +117,7 @@ def get_daily_report():
             SELECT COUNT(*), 
                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END),
                    SUM(pnl),
                    AVG(pnl_percent)
             FROM trades 
@@ -132,8 +127,9 @@ def get_daily_report():
         total = result[0] or 0
         win = result[1] or 0
         loss = result[2] or 0
-        total_pnl = result[3] or 0
-        avg_percent = result[4] or 0
+        breakeven = result[3] or 0
+        total_pnl = result[4] or 0
+        avg_percent = result[5] or 0
         winrate = (win / total * 100) if total > 0 else 0
         return f"""
 📊 *ОТЧЁТ ЗА {today}*
@@ -141,12 +137,15 @@ def get_daily_report():
 📈 *Всего сделок:* {total}
 🟢 *В прибыль:* {win}
 🔴 *В убыток:* {loss}
+⚪ *Безубыток:* {breakeven}
 🎯 *Winrate:* {winrate:.1f}%
 💰 *Общий P&L:* {total_pnl:.2f} USDT
+📊 *Средний %:* {avg_percent:.2f}%
 ━━━━━━━━━━━━━━━━━━━━━━━
 ⚠️ Не инвестрекомендация
 """
     except Exception as e:
+        logger.error(f"❌ Ошибка получения отчёта: {e}")
         return "❌ Ошибка получения отчёта"
     finally:
         conn.close()
@@ -170,6 +169,7 @@ def get_all_trades():
             response += f"\n{side_icon} {ticker} | {amount} USDT\n   Цена: {price:.2f} | {pnl_icon} P&L: {pnl:.2f}\n   {ts[:16]}\n"
         return response
     except Exception as e:
+        logger.error(f"❌ Ошибка получения сделок: {e}")
         return "❌ Ошибка получения истории"
     finally:
         conn.close()
@@ -464,7 +464,6 @@ def news_analyst(ticker):
         rss_url = "https://www.investing.com/rss/news_FOREX.rss"
         response = requests.get(rss_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         if response.status_code != 200:
-            logger.warning(f"⚠️ RSS недоступен: статус {response.status_code}")
             return "НЕЙТРАЛЬНЫЕ", "HOLD", "Нет данных", [], 0
         keywords_map = {
             'EUR': ['euro', 'ecb'], 'USD': ['dollar', 'fed'], 'GBP': ['pound'],
@@ -586,8 +585,10 @@ def portfolio_manager(ticker):
                 final_signal = "ДЕРЖАТЬ"
         response = f"""
 📊 *КОМПЛЕКСНЫЙ АНАЛИЗ: {ticker.upper()}*
+
 *МУЛЬТИ-ТАЙМФРЕЙМ*
 {mtf_analysis}
+
 *РАСШИРЕННЫЙ АНАЛИЗ (13 параметров)*
 """
         if adv_params:
@@ -601,10 +602,15 @@ def portfolio_manager(ticker):
                 sig_text = sig_map.get(sig, str(sig)[:10])
                 response += f"\n{name} {val:.1f} {sig_text}"
         response += f"""
+
 *Распределение:* BUY: {adv_buys} | SELL: {adv_sells} | NEUTRAL: {adv_neutrals}
+
 *Новости:* {sentiment}
+
 *Риск:* {risk_level}
+
 *ИТОГ:* {final_signal}
+
 ⚠️ Не инвестрекомендация
 """
         if is_otc:
@@ -682,32 +688,20 @@ def create_category_menu(category):
 # ========== ОБРАБОТЧИКИ ==========
 @bot.message_handler(commands=['start', 'menu'])
 def send_menu(message):
-    if not check_access(message):
-        bot.reply_to(message, "⛔ Доступ запрещён.")
-        return
     bot.send_message(message.chat.id, "📋 *ГЛАВНОЕ МЕНЮ*", parse_mode='Markdown', reply_markup=create_main_menu())
 
 @bot.message_handler(commands=['autostop'])
 def autostop_handler(message):
-    if not check_access(message):
-        bot.reply_to(message, "⛔ Доступ запрещён.")
-        return
     auto_trade_active[0] = False
     bot.reply_to(message, "🛑 *Автоторговля остановлена.*", parse_mode='Markdown')
 
 @bot.message_handler(commands=['autostart'])
 def autostart_handler(message):
-    if not check_access(message):
-        bot.reply_to(message, "⛔ Доступ запрещён.")
-        return
     auto_trade_active[0] = True
     bot.reply_to(message, "🤖 *Автоторговля запущена.*", parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
-    if not check_access(call):
-        bot.answer_callback_query(call.id, "⛔ Доступ запрещён.")
-        return
     data = call.data
     if data == "close_window":
         bot.edit_message_text("✅ *Окно закрыто*\n\nОтправьте /start для открытия главного меню.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
@@ -760,11 +754,10 @@ def handle_callback(call):
         return
     if data.startswith("auto_"):
         coin = data.replace("auto_", "")
-        status = "🟢 Активна" if auto_trade_active[0] else "🔴 Остановлена"
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("◀ НАЗАД", callback_data=f"crypto_{coin.lower()}"))
         kb.add(telebot.types.InlineKeyboardButton("❌ Закрыть", callback_data="close_window"))
-        bot.send_message(call.message.chat.id, f"🤖 *Автоторговля для {coin}*\n\n📊 Статус: {status}\n\n⚠️ Торговля ведётся на реальном счёте Bybit!", parse_mode='Markdown', reply_markup=kb)
+        bot.send_message(call.message.chat.id, f"🤖 *Автоторговля для {coin}*\n\n⚠️ Торговля ведётся на реальном счёте Bybit!", parse_mode='Markdown', reply_markup=kb)
         bot.answer_callback_query(call.id)
         return
     if data.startswith("an_"):
@@ -791,9 +784,6 @@ def handle_callback(call):
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    if not check_access(message):
-        bot.reply_to(message, "⛔ Доступ запрещён.")
-        return
     ticker = message.text.strip().upper()
     if ticker.startswith('/'):
         return
@@ -814,8 +804,6 @@ def handle_message(message):
 def auto_trade_loop():
     from ta.momentum import RSIIndicator
     coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]
-    settings = {coin: {"rsi_buy": 30, "rsi_sell": 70, "amount": 10} for coin in coins}
-    logger.info("🤖 АВТОТОРГОВЛЯ ЗАПУЩЕНА")
     while True:
         if not auto_trade_active[0]:
             time.sleep(10)
@@ -828,27 +816,15 @@ def auto_trade_loop():
                 ohlcv = exchange.fetch_ohlcv(f'{coin}/USDT', timeframe='15m', limit=100)
                 closes = [c[4] for c in ohlcv]
                 rsi = RSIIndicator(pd.Series(closes), window=14).rsi().iloc[-1]
-                cfg = settings[coin]
-                last_trade = get_last_open_trade(coin)
-                if last_trade is None:
-                    if rsi < cfg["rsi_buy"]:
-                        result = buy_coin(coin, cfg["amount"])
-                        logger.info(f"🟢 АВТО-ПОКУПКА {coin} RSI={rsi:.1f} | {result}")
-                        time.sleep(2)
-                else:
-                    trade_id, qty, entry_price = last_trade
-                    pnl_percent = ((price - entry_price) / entry_price) * 100
-                    if pnl_percent >= 3:
-                        result = sell_coin(coin, qty)
-                        logger.info(f"✅ ТЕЙК-ПРОФИТ {coin}: +{pnl_percent:.2f}% | {result}")
-                        time.sleep(2)
-                    elif pnl_percent <= -2:
-                        result = sell_coin(coin, qty)
-                        logger.info(f"🛑 СТОП-ЛОСС {coin}: {pnl_percent:.2f}% | {result}")
-                        time.sleep(2)
-                    elif rsi > cfg["rsi_sell"]:
-                        result = sell_coin(coin, qty)
-                        logger.info(f"🔴 АВТО-ПРОДАЖА {coin} RSI={rsi:.1f} | {result}")
+                if rsi < 30:
+                    buy_coin(coin, 10)
+                    logger.info(f"🟢 АВТО-ПОКУПКА {coin} RSI={rsi:.1f}")
+                    time.sleep(2)
+                elif rsi > 70:
+                    balance = get_coin_balance(coin)
+                    if balance > 0:
+                        sell_coin(coin, balance)
+                        logger.info(f"🔴 АВТО-ПРОДАЖА {coin} RSI={rsi:.1f}")
                         time.sleep(2)
             except Exception as e:
                 logger.error(f"⚠️ Ошибка автоторговли {coin}: {e}")
@@ -884,7 +860,6 @@ def health():
 def index():
     return 'Bot is running', 200
 
-# ========== ЗАПУСК ==========
 if __name__ == "__main__":
     set_webhook()
     port = int(os.environ.get('PORT', 8080))
