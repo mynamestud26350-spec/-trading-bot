@@ -3,7 +3,7 @@ import telebot
 import yfinance as yf
 import pandas as pd
 import ta
-import requests
+import feedparser
 import time
 import ccxt
 import sqlite3
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ========== НАСТРОЙКИ (берутся из переменных окружения) ==========
+# ========== НАСТРОЙКИ ==========
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
@@ -27,7 +27,13 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("❌ BYBIT ключи не найдены")
 
 # ========== ЛОГИРОВАНИЕ ==========
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
@@ -36,35 +42,67 @@ app = Flask(__name__)
 # ========== ФЛАГ АВТОТОРГОВЛИ ==========
 auto_trade_active = [True]
 
+# ========== АНТИФЛУД ==========
+_user_last_request = {}
+FLOOD_TIMEOUT = 5
+
+def is_flooding(user_id):
+    now = time.time()
+    last = _user_last_request.get(user_id, 0)
+    if now - last < FLOOD_TIMEOUT:
+        return True
+    _user_last_request[user_id] = now
+    return False
+
+# ========== ЗАЩИТА ДОСТУПА ==========
+def is_allowed(user_id):
+    if not ALLOWED_USER_IDS:
+        return True
+    return user_id in ALLOWED_USER_IDS
+
+def check_access(call_or_message):
+    uid = call_or_message.from_user.id
+    if not is_allowed(uid):
+        logger.warning(f"⛔ Попытка доступа: {uid}")
+        return False
+    return True
+
 # ========== БАЗА ДАННЫХ ==========
 DB_PATH = 'trades.db'
 
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            ticker TEXT,
-            side TEXT,
-            amount_usdt REAL,
-            price REAL,
-            qty REAL,
-            pnl REAL,
-            pnl_percent REAL,
-            status TEXT
-        )
-    ''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_status ON trades(ticker, status)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp)')
-    conn.commit()
-    conn.close()
-    logger.info("✅ База данных инициализирована")
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                ticker TEXT,
+                side TEXT,
+                amount_usdt REAL,
+                price REAL,
+                qty REAL,
+                pnl REAL,
+                pnl_percent REAL,
+                status TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticker_status ON trades(ticker, status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp)')
+        conn.commit()
+        logger.info("✅ База данных инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
+    finally:
+        conn.close()
 
 def save_trade(ticker, side, amount_usdt, price, qty, status="open"):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO trades (timestamp, ticker, side, amount_usdt, price, qty, pnl, pnl_percent, status)
@@ -79,14 +117,13 @@ def save_trade(ticker, side, amount_usdt, price, qty, status="open"):
 
 def update_trade_pnl(trade_id, pnl, pnl_percent):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE trades SET pnl = ?, pnl_percent = ?, status = 'closed'
             WHERE id = ?
         ''', (pnl, pnl_percent, trade_id))
         conn.commit()
-        logger.info(f"📝 Обновлена сделка #{trade_id}: pnl={pnl:.2f}")
     except Exception as e:
         logger.error(f"❌ Ошибка обновления сделки: {e}")
     finally:
@@ -94,33 +131,32 @@ def update_trade_pnl(trade_id, pnl, pnl_percent):
 
 def get_last_open_trade(ticker):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute('''
             SELECT id, qty, price FROM trades 
             WHERE ticker = ? AND status = 'open' 
             ORDER BY id DESC LIMIT 1
         ''', (ticker,))
-        result = cursor.fetchone()
-        return result
+        return cursor.fetchone()
     except Exception as e:
+        logger.error(f"❌ Ошибка get_last_open_trade: {e}")
         return None
     finally:
         conn.close()
 
 def get_daily_report():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cursor = conn.cursor()
         today = datetime.now().strftime('%Y-%m-%d')
         cursor.execute('''
-            SELECT COUNT(*), 
+            SELECT COUNT(*),
                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END),
-                   SUM(pnl),
-                   AVG(pnl_percent)
-            FROM trades 
+                   SUM(pnl), AVG(pnl_percent)
+            FROM trades
             WHERE date(timestamp) = date(?) AND status = 'closed'
         ''', (today,))
         result = cursor.fetchone()
@@ -145,14 +181,14 @@ def get_daily_report():
 ⚠️ Не инвестрекомендация
 """
     except Exception as e:
-        logger.error(f"❌ Ошибка получения отчёта: {e}")
+        logger.error(f"❌ Ошибка get_daily_report: {e}")
         return "❌ Ошибка получения отчёта"
     finally:
         conn.close()
 
 def get_all_trades():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_conn()
         cursor = conn.cursor()
         cursor.execute('''
             SELECT timestamp, ticker, side, amount_usdt, price, pnl, status
@@ -169,7 +205,7 @@ def get_all_trades():
             response += f"\n{side_icon} {ticker} | {amount} USDT\n   Цена: {price:.2f} | {pnl_icon} P&L: {pnl:.2f}\n   {ts[:16]}\n"
         return response
     except Exception as e:
-        logger.error(f"❌ Ошибка получения сделок: {e}")
+        logger.error(f"❌ Ошибка get_all_trades: {e}")
         return "❌ Ошибка получения истории"
     finally:
         conn.close()
@@ -239,7 +275,7 @@ def get_data_for_timeframe(ticker, interval, period_days):
     if cached is not None:
         return cached
     try:
-        data = yf.download(ticker, period=period_days, interval=interval, progress=False)
+        data = yf.download(ticker, period=period_days, interval=interval, progress=False, auto_adjust=True)
         if data.empty:
             logger.warning(f"⚠️ Нет данных для {ticker} {interval}")
             return None
@@ -249,12 +285,12 @@ def get_data_for_timeframe(ticker, interval, period_days):
             close = data['Close'] if 'Close' in data else data.iloc[:, 0]
         close = close.dropna()
         if len(close) < 20:
-            logger.warning(f"⚠️ Мало данных для {ticker} {interval}: {len(close)} свечей")
+            logger.warning(f"⚠️ Мало данных {ticker} {interval}: {len(close)} свечей")
             return None
         set_cached(cache_key, close)
         return close
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки данных {ticker} {interval}: {e}")
+        logger.error(f"❌ Ошибка загрузки {ticker} {interval}: {e}")
         return None
 
 def analyze_timeframe(close, timeframe_name):
@@ -281,9 +317,12 @@ def analyze_timeframe(close, timeframe_name):
             entry_signal, entry_score = "📉 ИЩЕМ SELL", -0.5
         else:
             entry_signal, entry_score = "⏸️ ЖДЁМ", 0
-        return {'price': current_price, 'trend': trend, 'trend_score': trend_score, 'rsi': rsi, 'entry_signal': entry_signal, 'entry_score': entry_score}
+        return {
+            'price': current_price, 'trend': trend, 'trend_score': trend_score,
+            'rsi': rsi, 'entry_signal': entry_signal, 'entry_score': entry_score
+        }
     except Exception as e:
-        logger.error(f"❌ Ошибка анализа таймфрейма {timeframe_name}: {e}")
+        logger.error(f"❌ Ошибка analyze_timeframe {timeframe_name}: {e}")
         return None
 
 def multi_timeframe_analyst(ticker):
@@ -306,7 +345,7 @@ def multi_timeframe_analyst(ticker):
             total_trend_score += analysis['trend_score'] * tf['weight']
             total_weight += tf['weight']
     if not results:
-        return None, "Нет данных", None
+        return None, "❌ Нет данных для анализа", None
     avg_trend = total_trend_score / total_weight if total_weight > 0 else 0
     if avg_trend > 0.3:
         overall_trend, overall_color = "📈 ТРЕНД ВВЕРХ", "🟢"
@@ -352,9 +391,9 @@ def multi_timeframe_analyst(ticker):
 def advanced_analysis(ticker, interval='60m'):
     try:
         fixed_ticker, _ = fix_ticker(ticker)
-        data = yf.download(fixed_ticker, period='3d', interval=interval, progress=False)
+        data = yf.download(fixed_ticker, period='3d', interval=interval, progress=False, auto_adjust=True)
         if data.empty:
-            logger.warning(f"⚠️ Нет данных для расширенного анализа {ticker}")
+            logger.warning(f"⚠️ Нет данных расширенного анализа {ticker}")
             return None
         if isinstance(data.columns, pd.MultiIndex):
             close = data['Close'].iloc[:, 0]
@@ -399,12 +438,8 @@ def advanced_analysis(ticker, interval='60m'):
         activity_val = min(100, atr_percent * 20)
         activity_signal = "OVERBOUGHT" if activity_val > 80 else ("NEUTRAL" if activity_val > 30 else "OVER SOLD")
         vpt = ta.volume.VolumePriceTrendIndicator(close, volume).volume_price_trend()
-        if len(vpt) >= 2 and vpt.iloc[-1] > vpt.iloc[-2]:
-            whale_signal, whale_val = "BUY", 70
-        elif len(vpt) >= 2:
-            whale_signal, whale_val = "SELL", 30
-        else:
-            whale_signal, whale_val = "NEUTRAL", 50
+        whale_signal = "BUY" if len(vpt) >= 2 and vpt.iloc[-1] > vpt.iloc[-2] else ("SELL" if len(vpt) >= 2 else "NEUTRAL")
+        whale_val = 70 if whale_signal == "BUY" else (30 if whale_signal == "SELL" else 50)
         ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1]
         noise_val = abs((current_price - ema20) / ema20) * 100 if ema20 > 0 else 0
         noise_signal = "LOW VOL" if noise_val < 0.3 else ("HIGH VOL" if noise_val > 1 else "NORMAL")
@@ -416,12 +451,8 @@ def advanced_analysis(ticker, interval='60m'):
         if len(high) >= 10:
             hh = high.iloc[-1] > high.iloc[-5]
             hl = low.iloc[-1] > low.iloc[-5]
-            if hh and hl:
-                structure_signal, structure_val = "BUY", 75
-            elif not hh and not hl:
-                structure_signal, structure_val = "SELL", 25
-            else:
-                structure_signal, structure_val = "NEUTRAL", 50
+            structure_signal = "BUY" if (hh and hl) else ("SELL" if (not hh and not hl) else "NEUTRAL")
+            structure_val = 75 if structure_signal == "BUY" else (25 if structure_signal == "SELL" else 50)
         else:
             structure_signal, structure_val = "NEUTRAL", 50
         bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
@@ -455,86 +486,156 @@ def advanced_analysis(ticker, interval='60m'):
         neutrals = len(params) - buys - sells
         return params, buys, sells, neutrals
     except Exception as e:
-        logger.error(f"❌ Ошибка расширенного анализа {ticker}: {e}")
+        logger.error(f"❌ Ошибка advanced_analysis {ticker}: {e}")
         return None
 
+# ========== НОВОСТИ ЧЕРЕЗ FEEDPARSER ==========
 def news_analyst(ticker):
     try:
         currency_code = ticker[:3].upper()
-        rss_url = "https://www.investing.com/rss/news_FOREX.rss"
-        response = requests.get(rss_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-        if response.status_code != 200:
-            return "НЕЙТРАЛЬНЫЕ", "HOLD", "Нет данных", [], 0
         keywords_map = {
-            'EUR': ['euro', 'ecb'], 'USD': ['dollar', 'fed'], 'GBP': ['pound'],
-            'JPY': ['yen'], 'AUD': ['aussie'], 'CAD': ['loonie'], 'CHF': ['franc']
+            'EUR': ['euro', 'ecb', 'european'],
+            'USD': ['dollar', 'fed', 'federal reserve'],
+            'GBP': ['pound', 'sterling', 'boe'],
+            'JPY': ['yen', 'boj'],
+            'AUD': ['aussie', 'rba'],
+            'CAD': ['loonie', 'canada', 'boc'],
+            'CHF': ['franc', 'snb']
         }
         keywords = keywords_map.get(currency_code, [currency_code.lower()])
-        content = response.text
+
+        feed = feedparser.parse(
+            "https://www.investing.com/rss/news_FOREX.rss",
+            request_headers={'User-Agent': 'Mozilla/5.0'}
+        )
+
+        if not feed.entries:
+            logger.warning("⚠️ RSS лента пуста")
+            return "НЕЙТРАЛЬНЫЕ", "HOLD", "Нет данных", [], 0
+
+        positive_words = ['surge', 'gain', 'rise', 'up', 'positive', 'strong', 'bullish']
+        negative_words = ['drop', 'fall', 'decline', 'down', 'negative', 'weak', 'bearish']
+
         news_items = []
-        for line in content.split('\n'):
-            if '<title>' in line:
-                title = line.replace('<title>', '').replace('</title>', '').strip()
-                title_lower = title.lower()
-                relevance = sum(1 for kw in keywords if kw in title_lower)
-                if relevance > 0:
-                    sentiment = 0
-                    for w in ['surge', 'gain', 'rise', 'up', 'positive']:
-                        if w in title_lower: sentiment += 1
-                    for w in ['drop', 'fall', 'decline', 'down', 'negative']:
-                        if w in title_lower: sentiment -= 1
-                    news_items.append({'title': title[:80], 'sentiment': sentiment})
+        for entry in feed.entries[:30]:
+            title = entry.get('title', '')
+            title_lower = title.lower()
+            if any(kw in title_lower for kw in keywords):
+                sentiment = sum(1 for w in positive_words if w in title_lower) - \
+                            sum(1 for w in negative_words if w in title_lower)
+                news_items.append({'title': title[:80], 'sentiment': sentiment})
+
         if not news_items:
             return "НЕЙТРАЛЬНЫЕ", "HOLD", "Нет новостей", [], 0
+
         news_items.sort(key=lambda x: abs(x['sentiment']), reverse=True)
         top_news = news_items[:3]
         total = sum(n['sentiment'] for n in top_news)
+
         if total > 0:
             return "ПОЗИТИВНЫЕ", "BUY", "Новости позитивные", top_news, total
         elif total < 0:
             return "НЕГАТИВНЫЕ", "SELL", "Новости негативные", top_news, total
         return "НЕЙТРАЛЬНЫЕ", "HOLD", "Новости нейтральные", top_news, total
     except Exception as e:
-        logger.error(f"❌ Ошибка новостного анализа: {e}")
+        logger.error(f"❌ Ошибка news_analyst: {e}")
         return "НЕЙТРАЛЬНЫЕ", "HOLD", "Ошибка", [], 0
 
 def risk_manager_binary(is_otc=False):
-    if is_otc:
-        return "🟡 СРЕДНИЙ", "Всегда только 1% депозита"
-    return "🟢 НИЗКИЙ", "Всегда только 1% депозита"
+    return ("🟡 СРЕДНИЙ", "1% депозита") if is_otc else ("🟢 НИЗКИЙ", "1% депозита")
+
+# ========== ПОРТФЕЛЬНЫЙ МЕНЕДЖЕР ==========
+def portfolio_manager(ticker):
+    try:
+        mtf_results, mtf_analysis, mtf_signal = multi_timeframe_analyst(ticker)
+        if mtf_results is None:
+            return f"❌ Нет данных по {ticker}. Проверьте название пары."
+        _, is_otc = fix_ticker(ticker)
+        advanced = advanced_analysis(ticker, '60m')
+        adv_params, adv_buys, adv_sells, adv_neutrals = (advanced[0], advanced[1], advanced[2], advanced[3]) if advanced else (None, 0, 0, 0)
+        sentiment = news_analyst(ticker)[0]
+        risk_level = risk_manager_binary(is_otc)[0]
+        if adv_params:
+            if adv_buys > adv_sells + 2:
+                final_signal = "✅ ПОКУПАТЬ"
+            elif adv_sells > adv_buys + 2:
+                final_signal = "❌ ПРОДАВАТЬ"
+            elif adv_buys > adv_sells:
+                final_signal = "🟡 ПОКУПАТЬ (осторожно)"
+            elif adv_sells > adv_buys:
+                final_signal = "🟡 ПРОДАВАТЬ (осторожно)"
+            else:
+                final_signal = "⏸️ ДЕРЖАТЬ"
+        else:
+            if "СИЛЬНЫЙ BUY" in str(mtf_signal):
+                final_signal = "✅ ПОКУПАТЬ"
+            elif "СИЛЬНЫЙ SELL" in str(mtf_signal):
+                final_signal = "❌ ПРОДАВАТЬ"
+            elif "BUY" in str(mtf_signal):
+                final_signal = "🟡 ПОКУПАТЬ (осторожно)"
+            elif "SELL" in str(mtf_signal):
+                final_signal = "🟡 ПРОДАВАТЬ (осторожно)"
+            else:
+                final_signal = "⏸️ ДЕРЖАТЬ"
+        response = f"📊 *КОМПЛЕКСНЫЙ АНАЛИЗ: {ticker.upper()}*\n{mtf_analysis}\n*РАСШИРЕННЫЙ АНАЛИЗ (13 параметров)*"
+        if adv_params:
+            sig_map = {
+                "BUY": "✅ Покупка", "SELL": "❌ Продажа", "NEUTRAL": "➖ Нейтрально",
+                "OVERBOUGHT": "⚠️ Перекуп", "OVER SOLD": "⚠️ Перепрод",
+                "LOW VOL": "💤 Низк.Вол", "HIGH VOL": "🔥 Выс.Вол",
+                "TRENDING": "📈 Тренд", "RANGING": "↔️ Флэт", "NORMAL": "➖ Норма"
+            }
+            for name, val, sig in adv_params:
+                sig_text = sig_map.get(sig, str(sig)[:12])
+                response += f"\n{name}: `{val:.1f}` {sig_text}"
+        response += f"\n\n*Распределение:* ✅{adv_buys} ❌{adv_sells} ➖{adv_neutrals}"
+        response += f"\n*Новости:* {sentiment}"
+        response += f"\n*Риск:* {risk_level}"
+        response += f"\n\n🎯 *ИТОГ: {final_signal}*"
+        response += "\n\n⚠️ Не инвестрекомендация"
+        if is_otc:
+            response += "\n⚡ OTC — волатильность выше"
+        return response
+    except Exception as e:
+        logger.error(f"❌ Ошибка portfolio_manager {ticker}: {e}")
+        return f"❌ Ошибка анализа {ticker}. Попробуйте позже."
 
 # ========== КРИПТО-ТРЕЙДИНГ ==========
 def get_coin_balance(symbol):
     try:
         bal = exchange.fetch_balance()
         return bal[symbol]['free'] if symbol in bal else 0
-    except:
+    except Exception as e:
+        logger.error(f"❌ Ошибка баланса {symbol}: {e}")
         return 0
 
 def get_coin_price(symbol):
     try:
         ticker = exchange.fetch_ticker(f'{symbol}/USDT')
         return ticker['last']
-    except:
+    except Exception as e:
+        logger.error(f"❌ Ошибка цены {symbol}: {e}")
         return 0
 
 def buy_coin(symbol, amount_usdt):
     try:
         price = get_coin_price(symbol)
         if price == 0:
-            return f"❌ Не удалось получить цену {symbol}"
+            return f"❌ Нет цены {symbol}"
         qty = round(amount_usdt / price, 5)
         exchange.create_market_buy_order(f'{symbol}/USDT', qty)
         save_trade(symbol, "buy", amount_usdt, price, qty, "open")
+        logger.info(f"🟢 ПОКУПКА {symbol} qty={qty} price={price}")
         return f"✅ Куплено {qty} {symbol} по {price} USDT"
     except Exception as e:
+        logger.error(f"❌ Ошибка покупки {symbol}: {e}")
         return f"❌ Ошибка: {e}"
 
 def sell_coin(symbol, qty):
     try:
         price = get_coin_price(symbol)
         if price == 0:
-            return f"❌ Не удалось получить цену {symbol}"
+            return f"❌ Нет цены {symbol}"
         exchange.create_market_sell_order(f'{symbol}/USDT', qty)
         last_trade = get_last_open_trade(symbol)
         if last_trade:
@@ -542,83 +643,12 @@ def sell_coin(symbol, qty):
             pnl = (price - entry_price) * qty
             pnl_percent = ((price - entry_price) / entry_price) * 100
             update_trade_pnl(trade_id, pnl, pnl_percent)
-            return f"✅ Продано {qty} {symbol} по {price} USDT | P&L: {pnl:.2f} USDT"
+            logger.info(f"🔴 ПРОДАЖА {symbol} pnl={pnl:.2f}")
+            return f"✅ Продано {qty} {symbol} по {price} | P&L: {pnl:.2f} USDT ({pnl_percent:.2f}%)"
         return f"✅ Продано {qty} {symbol} по {price} USDT"
     except Exception as e:
+        logger.error(f"❌ Ошибка продажи {symbol}: {e}")
         return f"❌ Ошибка: {e}"
-
-# ========== ПОРТФЕЛЬНЫЙ МЕНЕДЖЕР ==========
-def portfolio_manager(ticker):
-    try:
-        mtf_results, mtf_analysis, mtf_signal = multi_timeframe_analyst(ticker)
-        if mtf_results is None:
-            return f"❌ Нет данных по {ticker}"
-        _, is_otc = fix_ticker(ticker)
-        advanced = advanced_analysis(ticker, '60m')
-        if advanced:
-            adv_params, adv_buys, adv_sells, adv_neutrals = advanced
-        else:
-            adv_params, adv_buys, adv_sells, adv_neutrals = None, 0, 0, 0
-        sentiment, news_verdict, news_reason, news_list, news_score = news_analyst(ticker)
-        risk_level, risk_advice = risk_manager_binary(is_otc)
-        if adv_params:
-            if adv_buys > adv_sells + 2:
-                final_signal = "ПОКУПАТЬ"
-            elif adv_sells > adv_buys + 2:
-                final_signal = "ПРОДАВАТЬ"
-            elif adv_buys > adv_sells:
-                final_signal = "ПОКУПАТЬ (осторожно)"
-            elif adv_sells > adv_buys:
-                final_signal = "ПРОДАВАТЬ (осторожно)"
-            else:
-                final_signal = "ДЕРЖАТЬ"
-        else:
-            if "СИЛЬНЫЙ BUY" in str(mtf_signal):
-                final_signal = "ПОКУПАТЬ"
-            elif "СИЛЬНЫЙ SELL" in str(mtf_signal):
-                final_signal = "ПРОДАВАТЬ"
-            elif "BUY" in str(mtf_signal):
-                final_signal = "ПОКУПАТЬ (осторожно)"
-            elif "SELL" in str(mtf_signal):
-                final_signal = "ПРОДАВАТЬ (осторожно)"
-            else:
-                final_signal = "ДЕРЖАТЬ"
-        response = f"""
-📊 *КОМПЛЕКСНЫЙ АНАЛИЗ: {ticker.upper()}*
-
-*МУЛЬТИ-ТАЙМФРЕЙМ*
-{mtf_analysis}
-
-*РАСШИРЕННЫЙ АНАЛИЗ (13 параметров)*
-"""
-        if adv_params:
-            sig_map = {
-                "BUY": "Покупка", "SELL": "Продажа", "NEUTRAL": "Нейтрально",
-                "OVERBOUGHT": "Перекуп-ть", "OVER SOLD": "Перепрод-ть",
-                "LOW VOL": "Низк. Вол.", "HIGH VOL": "Выс. Вол.",
-                "TRENDING": "Тренд", "RANGING": "Флэт"
-            }
-            for name, val, sig in adv_params:
-                sig_text = sig_map.get(sig, str(sig)[:10])
-                response += f"\n{name} {val:.1f} {sig_text}"
-        response += f"""
-
-*Распределение:* BUY: {adv_buys} | SELL: {adv_sells} | NEUTRAL: {adv_neutrals}
-
-*Новости:* {sentiment}
-
-*Риск:* {risk_level}
-
-*ИТОГ:* {final_signal}
-
-⚠️ Не инвестрекомендация
-"""
-        if is_otc:
-            response += f"\n⚡ OTC — волатильность выше"
-        return response
-    except Exception as e:
-        logger.error(f"❌ Ошибка portfolio_manager: {e}")
-        return f"❌ Ошибка анализа {ticker}"
 
 # ========== МЕНЮ ==========
 def create_main_menu():
@@ -654,16 +684,8 @@ def create_coin_menu(coin, symbol):
 
 def create_category_menu(category):
     categories = {
-        "forex": {
-            "title": "💰 ВАЛЮТНЫЕ ПАРЫ\nВыберите пару:",
-            "pairs": FOREX_PAIRS,
-            "back_to": "menu_forex"
-        },
-        "forex_otc": {
-            "title": "⚡ OTC ВАЛЮТНЫЕ ПАРЫ\n⚠️ Повышенная волатильность!\nВыберите пару:",
-            "pairs": OTC_PAIRS,
-            "back_to": "menu_forex_otc"
-        }
+        "forex": {"title": "💰 ВАЛЮТНЫЕ ПАРЫ\nВыберите пару:", "pairs": FOREX_PAIRS, "back_to": "menu_forex"},
+        "forex_otc": {"title": "⚡ OTC ПАРЫ\n⚠️ Повышенная волатильность!\nВыберите пару:", "pairs": OTC_PAIRS, "back_to": "menu_forex_otc"}
     }
     cat = categories.get(category)
     if not cat:
@@ -685,43 +707,76 @@ def create_category_menu(category):
     kb.add(telebot.types.InlineKeyboardButton("❌ Закрыть", callback_data="close_window"))
     return kb, cat["title"]
 
-# ========== ОБРАБОТЧИКИ ==========
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 @bot.message_handler(commands=['start', 'menu'])
 def send_menu(message):
+    if not check_access(message):
+        bot.reply_to(message, "⛔ Доступ запрещён.")
+        return
     bot.send_message(message.chat.id, "📋 *ГЛАВНОЕ МЕНЮ*", parse_mode='Markdown', reply_markup=create_main_menu())
 
 @bot.message_handler(commands=['autostop'])
 def autostop_handler(message):
+    if not check_access(message):
+        return
     auto_trade_active[0] = False
     bot.reply_to(message, "🛑 *Автоторговля остановлена.*", parse_mode='Markdown')
 
 @bot.message_handler(commands=['autostart'])
 def autostart_handler(message):
+    if not check_access(message):
+        return
     auto_trade_active[0] = True
     bot.reply_to(message, "🤖 *Автоторговля запущена.*", parse_mode='Markdown')
 
+@bot.message_handler(commands=['status'])
+def status_handler(message):
+    if not check_access(message):
+        return
+    status = "🟢 Активна" if auto_trade_active[0] else "🔴 Остановлена"
+    bot.reply_to(message, f"🤖 *Автоторговля:* {status}", parse_mode='Markdown')
+
+# ========== ОБРАБОТЧИК КНОПОК ==========
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
+    if not check_access(call):
+        bot.answer_callback_query(call.id, "⛔ Доступ запрещён.")
+        return
+
+    uid = call.from_user.id
     data = call.data
+
+    if data.startswith("an_") and is_flooding(uid):
+        bot.answer_callback_query(call.id, "⏳ Подождите 5 сек. между запросами.", show_alert=True)
+        return
+
     if data == "close_window":
-        bot.edit_message_text("✅ *Окно закрыто*\n\nОтправьте /start для открытия главного меню.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+        bot.edit_message_text("✅ *Окно закрыто*\n\nОтправьте /start для открытия меню.",
+                              call.message.chat.id, call.message.message_id, parse_mode='Markdown')
         bot.answer_callback_query(call.id)
         return
+
     if data == "back_to_menu":
-        bot.edit_message_text("📋 *ГЛАВНОЕ МЕНЮ*", call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=create_main_menu())
+        bot.edit_message_text("📋 *ГЛАВНОЕ МЕНЮ*", call.message.chat.id, call.message.message_id,
+                              parse_mode='Markdown', reply_markup=create_main_menu())
         bot.answer_callback_query(call.id)
         return
+
     if data in ("menu_forex", "menu_forex_otc"):
         category = "forex" if data == "menu_forex" else "forex_otc"
         kb, title = create_category_menu(category)
         if kb:
-            bot.edit_message_text(title, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=kb)
+            bot.edit_message_text(title, call.message.chat.id, call.message.message_id,
+                                  parse_mode='Markdown', reply_markup=kb)
         bot.answer_callback_query(call.id)
         return
+
     if data in ("menu_crypto", "back_to_crypto"):
-        bot.edit_message_text("📊 *КРИПТО-ТРЕЙДИНГ*", call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=create_crypto_menu())
+        bot.edit_message_text("📊 *КРИПТО-ТРЕЙДИНГ*", call.message.chat.id, call.message.message_id,
+                              parse_mode='Markdown', reply_markup=create_crypto_menu())
         bot.answer_callback_query(call.id)
         return
+
     coin_map = {
         "crypto_btc": "BTC", "crypto_eth": "ETH", "crypto_sol": "SOL",
         "crypto_bnb": "BNB", "crypto_xrp": "XRP", "crypto_doge": "DOGE"
@@ -729,9 +784,11 @@ def handle_callback(call):
     if data in coin_map:
         coin = coin_map[data]
         kb, title = create_coin_menu(coin, coin)
-        bot.edit_message_text(title, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=kb)
+        bot.edit_message_text(title, call.message.chat.id, call.message.message_id,
+                              parse_mode='Markdown', reply_markup=kb)
         bot.answer_callback_query(call.id)
         return
+
     if data.startswith("balance_"):
         coin = data.replace("balance_", "")
         balance = get_coin_balance(coin)
@@ -740,9 +797,12 @@ def handle_callback(call):
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("◀ НАЗАД", callback_data=f"crypto_{coin.lower()}"))
         kb.add(telebot.types.InlineKeyboardButton("❌ Закрыть", callback_data="close_window"))
-        bot.send_message(call.message.chat.id, f"💰 *{coin} БАЛАНС*\n━━━━━━━━━━━━━━━\n{coin}: {balance:.8f}\nЦена: {price:.2f} USDT\nСтоимость: {value:.2f} USDT", parse_mode='Markdown', reply_markup=kb)
+        bot.send_message(call.message.chat.id,
+                         f"💰 *{coin} БАЛАНС*\n━━━━━━━━━━━━━━━\n{coin}: {balance:.8f}\nЦена: {price:.2f} USDT\nСтоимость: {value:.2f} USDT",
+                         parse_mode='Markdown', reply_markup=kb)
         bot.answer_callback_query(call.id)
         return
+
     if data == "crypto_report":
         report = get_daily_report()
         history = get_all_trades()
@@ -752,58 +812,90 @@ def handle_callback(call):
         bot.send_message(call.message.chat.id, f"{report}\n\n{history}", parse_mode='Markdown', reply_markup=kb)
         bot.answer_callback_query(call.id)
         return
+
     if data.startswith("auto_"):
         coin = data.replace("auto_", "")
+        status = "🟢 Активна" if auto_trade_active[0] else "🔴 Остановлена"
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("◀ НАЗАД", callback_data=f"crypto_{coin.lower()}"))
         kb.add(telebot.types.InlineKeyboardButton("❌ Закрыть", callback_data="close_window"))
-        bot.send_message(call.message.chat.id, f"🤖 *Автоторговля для {coin}*\n\n⚠️ Торговля ведётся на реальном счёте Bybit!", parse_mode='Markdown', reply_markup=kb)
+        bot.send_message(call.message.chat.id,
+                         f"🤖 *Автоторговля {coin}*\n\nСтатус: {status}\n\n"
+                         f"• RSI Buy < 30\n• RSI Sell > 70\n• Тейк: +3%\n• Стоп: -2%\n• Сумма: 10 USDT\n\n"
+                         f"⚙️ /autostart | /autostop | /status\n\n⚠️ Реальный счёт Bybit!",
+                         parse_mode='Markdown', reply_markup=kb)
         bot.answer_callback_query(call.id)
         return
+
     if data.startswith("an_"):
         ticker = data.replace("an_", "")
         bot.answer_callback_query(call.id, "🔍 Анализирую...")
         wait_msg = bot.send_message(call.message.chat.id, "⏳ *Анализирую...* Подождите.", parse_mode='Markdown')
-        def run_analysis():
+
+        def run_analysis(t=ticker, chat_id=call.message.chat.id, wait_id=wait_msg.message_id):
             try:
-                result = portfolio_manager(ticker)
-                back_callback = "menu_forex_otc" if "_otc" in ticker else "menu_forex"
+                result = portfolio_manager(t)
+                back_cb = "menu_forex_otc" if "_otc" in t else "menu_forex"
                 kb = telebot.types.InlineKeyboardMarkup()
                 kb.add(
-                    telebot.types.InlineKeyboardButton("◀ НАЗАД К ПАРАМ", callback_data=back_callback),
+                    telebot.types.InlineKeyboardButton("◀ НАЗАД К ПАРАМ", callback_data=back_cb),
                     telebot.types.InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_menu")
                 )
                 kb.add(telebot.types.InlineKeyboardButton("❌ Закрыть", callback_data="close_window"))
-                bot.delete_message(call.message.chat.id, wait_msg.message_id)
-                bot.send_message(call.message.chat.id, result, parse_mode='Markdown', reply_markup=kb)
+                try:
+                    bot.delete_message(chat_id, wait_id)
+                except Exception:
+                    pass
+                bot.send_message(chat_id, result, parse_mode='Markdown', reply_markup=kb)
             except Exception as e:
-                logger.error(f"❌ Ошибка анализа: {e}")
-                bot.edit_message_text("❌ Ошибка анализа. Попробуйте позже.", call.message.chat.id, wait_msg.message_id)
+                logger.error(f"❌ Ошибка run_analysis {t}: {e}")
+                try:
+                    bot.edit_message_text("❌ Ошибка анализа. Попробуйте позже.", chat_id, wait_id)
+                except Exception:
+                    pass
+
         threading.Thread(target=run_analysis, daemon=True).start()
         return
 
+# ========== ОБРАБОТЧИК ТЕКСТА ==========
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
+    if not check_access(message):
+        bot.reply_to(message, "⛔ Доступ запрещён.")
+        return
     ticker = message.text.strip().upper()
     if ticker.startswith('/'):
         return
+    if is_flooding(message.from_user.id):
+        bot.reply_to(message, "⏳ Подождите 5 секунд между запросами.")
+        return
     wait_msg = bot.reply_to(message, "⏳ *Анализирую...* Подождите.", parse_mode='Markdown')
-    def run_analysis():
+
+    def run_analysis(t=ticker, chat_id=message.chat.id, wait_id=wait_msg.message_id, orig_msg=message):
         try:
-            result = portfolio_manager(ticker)
+            result = portfolio_manager(t)
             kb = telebot.types.InlineKeyboardMarkup()
             kb.add(telebot.types.InlineKeyboardButton("◀ В ГЛАВНОЕ МЕНЮ", callback_data="back_to_menu"))
-            bot.delete_message(message.chat.id, wait_msg.message_id)
-            bot.reply_to(message, result, parse_mode='Markdown', reply_markup=kb)
+            try:
+                bot.delete_message(chat_id, wait_id)
+            except Exception:
+                pass
+            bot.reply_to(orig_msg, result, parse_mode='Markdown', reply_markup=kb)
         except Exception as e:
             logger.error(f"❌ Ошибка handle_message: {e}")
-            bot.edit_message_text("❌ Ошибка анализа.", message.chat.id, wait_msg.message_id)
+            try:
+                bot.edit_message_text("❌ Ошибка анализа.", chat_id, wait_id)
+            except Exception:
+                pass
+
     threading.Thread(target=run_analysis, daemon=True).start()
 
 # ========== АВТОТОРГОВЛЯ ==========
 def auto_trade_loop():
     from ta.momentum import RSIIndicator
     coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]
+    settings = {coin: {"rsi_buy": 30, "rsi_sell": 70, "take_profit": 3, "stop_loss": 2, "amount": 10} for coin in coins}
+    logger.info("🤖 АВТОТОРГОВЛЯ ЗАПУЩЕНА")
     while True:
         if not auto_trade_active[0]:
             time.sleep(10)
@@ -816,14 +908,26 @@ def auto_trade_loop():
                 ohlcv = exchange.fetch_ohlcv(f'{coin}/USDT', timeframe='15m', limit=100)
                 closes = [c[4] for c in ohlcv]
                 rsi = RSIIndicator(pd.Series(closes), window=14).rsi().iloc[-1]
-                if rsi < 30:
-                    buy_coin(coin, 10)
-                    logger.info(f"🟢 АВТО-ПОКУПКА {coin} RSI={rsi:.1f}")
-                    time.sleep(2)
-                elif rsi > 70:
-                    balance = get_coin_balance(coin)
-                    if balance > 0:
-                        sell_coin(coin, balance)
+                cfg = settings[coin]
+                last_trade = get_last_open_trade(coin)
+                if last_trade is None:
+                    if rsi < cfg["rsi_buy"]:
+                        result = buy_coin(coin, cfg["amount"])
+                        logger.info(f"🟢 АВТО-ПОКУПКА {coin} RSI={rsi:.1f} | {result}")
+                        time.sleep(2)
+                else:
+                    trade_id, qty, entry_price = last_trade
+                    pnl_pct = ((price - entry_price) / entry_price) * 100
+                    if pnl_pct >= cfg["take_profit"]:
+                        result = sell_coin(coin, qty)
+                        logger.info(f"✅ ТЕЙК {coin}: +{pnl_pct:.2f}%")
+                        time.sleep(2)
+                    elif pnl_pct <= -cfg["stop_loss"]:
+                        result = sell_coin(coin, qty)
+                        logger.info(f"🛑 СТОП {coin}: {pnl_pct:.2f}%")
+                        time.sleep(2)
+                    elif rsi > cfg["rsi_sell"]:
+                        result = sell_coin(coin, qty)
                         logger.info(f"🔴 АВТО-ПРОДАЖА {coin} RSI={rsi:.1f}")
                         time.sleep(2)
             except Exception as e:
@@ -831,8 +935,7 @@ def auto_trade_loop():
             time.sleep(1)
         time.sleep(60)
 
-auto_trade_thread = threading.Thread(target=auto_trade_loop, daemon=True)
-auto_trade_thread.start()
+threading.Thread(target=auto_trade_loop, daemon=True).start()
 
 # ========== WEBHOOK ==========
 def set_webhook():
@@ -840,6 +943,7 @@ def set_webhook():
     if render_url:
         webhook_url = f"{render_url}/{TOKEN}"
         bot.remove_webhook()
+        time.sleep(1)
         bot.set_webhook(url=webhook_url)
         logger.info(f"✅ Webhook установлен: {webhook_url}")
 
