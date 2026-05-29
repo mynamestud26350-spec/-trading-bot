@@ -1,5 +1,4 @@
 pyTelegramBotAPI==4.16.0
-yfinance==0.2.55
 pandas==2.2.2
 numpy==1.26.4
 ta==0.10.2
