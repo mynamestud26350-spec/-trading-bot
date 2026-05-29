@@ -2,6 +2,7 @@ import os
 import telebot
 import pandas as pd
 import ta
+import requests
 import time
 import ccxt
 import sqlite3
@@ -16,12 +17,15 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 ALLOWED_USER_IDS = list(map(int, os.getenv("ALLOWED_USER_IDS", "").split(","))) if os.getenv("ALLOWED_USER_IDS") else []
 
 if not TOKEN:
     raise ValueError("❌ TELEGRAM_TOKEN не найден")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("❌ BYBIT ключи не найдены")
+if not TWELVEDATA_API_KEY:
+    raise ValueError("❌ TWELVEDATA_API_KEY не найден")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -167,34 +171,25 @@ exchange = ccxt.bybit({
     'enableRateLimit': True,
 })
 
-# ========== ВАЛЮТНЫЕ ПАРЫ через Bybit ==========
-FOREX_PAIRS = {
-    'EURUSD': 'EUR/USDT',
-    'GBPUSD': 'GBP/USDT',
-    'AUDUSD': 'AUD/USDT',
-    'USDJPY': 'USD/JPY',
-    'USDCAD': 'USDCAD',
-    'USDCHF': 'USDCHF',
-    'NZDUSD': 'NZD/USDT',
-}
-
-def get_forex_price(ticker):
-    """Получает текущую цену валютной пары через Bybit"""
+# ========== TWELVE DATA ==========
+def get_twelvedata_candles(symbol, interval, count=100):
+    """Получает исторические данные с Twelve Data"""
+    interval_map = {
+        '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '60m': '1h'
+    }
+    td_interval = interval_map.get(interval, '15min')
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={td_interval}&outputsize={count}&apikey={TWELVEDATA_API_KEY}"
     try:
-        symbol = FOREX_PAIRS.get(ticker, ticker.replace("=", "/"))
-        ticker_data = exchange.fetch_ticker(f'{symbol}')
-        return ticker_data['last']
-    except:
-        return None
-
-def get_forex_history(ticker, timeframe='15m', limit=100):
-    """Получает историю цен для валютной пары"""
-    try:
-        symbol = FOREX_PAIRS.get(ticker, ticker.replace("=", "/"))
-        ohlcv = exchange.fetch_ohlcv(f'{symbol}', timeframe=timeframe, limit=limit)
-        closes = [c[4] for c in ohlcv]
-        return pd.Series(closes)
-    except:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        if "values" not in data:
+            return None
+        closes = [float(v['close']) for v in data['values']]
+        if len(closes) < 20:
+            return None
+        return pd.Series(closes[::-1])  # переворачиваем для правильного порядка
+    except Exception as e:
+        logger.error(f"Twelve Data ошибка {symbol}: {e}")
         return None
 
 def calculate_ema(series, length):
@@ -214,23 +209,58 @@ def analyze_series(close):
         trend, ts = "➡️ ФЛЕТ", 0
     return {'price': current, 'trend': trend, 'ts': ts, 'rsi': rsi}
 
+def multi_timeframe_analyst(ticker):
+    results = {}
+    total_ts = 0
+    total_w = 0
+    timeframes = [
+        ('1H', '60m', 3), ('30M', '30m', 2), ('15M', '15m', 2),
+        ('5M', '5m', 1), ('1M', '1m', 1)
+    ]
+    for name, interval, weight in timeframes:
+        close = get_twelvedata_candles(ticker, interval, 100)
+        if close is None:
+            continue
+        a = analyze_series(close)
+        if a:
+            results[name] = a
+            total_ts += a['ts'] * weight
+            total_w += weight
+        time.sleep(0.5)
+    if not results:
+        return None, f"❌ Нет данных для {ticker}", None
+    avg = total_ts / total_w
+    if avg > 0.3:
+        overall, color = "📈 ТРЕНД ВВЕРХ", "🟢"
+    elif avg < -0.3:
+        overall, color = "📉 ТРЕНД ВНИЗ", "🔴"
+    else:
+        overall, color = "🟡 ФЛЕТ", "🟡"
+    signal = "⏸️ ВНЕ РЫНКА"
+    if '1M' in results:
+        if avg > 0.3 and results['1M']['ts'] > 0:
+            signal = "🔵 СИЛЬНЫЙ BUY"
+        elif avg < -0.3 and results['1M']['ts'] < 0:
+            signal = "🔴 СИЛЬНЫЙ SELL"
+    icons = []
+    for tf in ['1H', '30M', '15M', '5M', '1M']:
+        if tf in results:
+            icons.append(f"{tf}⬆️" if "ВВЕРХ" in results[tf]['trend'] else f"{tf}⬇️" if "ВНИЗ" in results[tf]['trend'] else f"{tf}➡️")
+    response = f"""
+{color} *МУЛЬТИ-ТАЙМФРЕЙМ: {ticker}*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{' '.join(icons)}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+*ОБЩИЙ ТРЕНД:* {overall}
+🎯 *СИГНАЛ:* {signal}
+⏰ Экспирация: 1-2 минуты (вход со следующей свечи)
+"""
+    return results, response, signal
+
 def portfolio_manager(ticker):
     try:
-        close = get_forex_history(ticker, '30m', 100)
-        if close is None:
-            return f"❌ Нет данных для {ticker}"
-        analysis = analyze_series(close)
-        if analysis is None:
-            return f"❌ Ошибка анализа {ticker}"
-        return f"""
-📊 *АНАЛИЗ: {ticker}*
-━━━━━━━━━━━━━━━━━━━━━━━
-💰 *Цена:* {analysis['price']:.5f}
-📈 *Тренд:* {analysis['trend']}
-📉 *RSI:* {analysis['rsi']:.1f}
-━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ Не инвестрекомендация
-"""
+        _, resp, _ = multi_timeframe_analyst(ticker)
+        return resp if resp else f"❌ Нет данных для {ticker}"
     except Exception as e:
         return f"❌ Ошибка анализа {ticker}: {e}"
 
@@ -307,7 +337,8 @@ def create_coin_menu(coin, sym):
     return kb, f"📊 *{coin} ({sym})*"
 
 def create_category_menu(category):
-    pairs = list(FOREX_PAIRS.keys()) if category == "forex" else [p + "_otc" for p in FOREX_PAIRS.keys()]
+    forex_list = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCAD", "USDCHF", "NZDUSD"]
+    pairs = forex_list if category == "forex" else [p + "_otc" for p in forex_list]
     title = "💰 ВАЛЮТНЫЕ ПАРЫ" if category == "forex" else "⚡ OTC ПАРЫ (⚠️ волатильность)"
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     for p in pairs:
@@ -326,7 +357,7 @@ def send_menu(m):
 
 @bot.message_handler(commands=['test'])
 def test(m):
-    bot.reply_to(m, "✅ Бот работает через Bybit API. Выбери валютную пару.")
+    bot.reply_to(m, "✅ Бот работает через Twelve Data API. Выбери валютную пару.")
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -367,7 +398,7 @@ def handle_callback(call):
     if data.startswith("an_"):
         ticker = data.replace("an_", "").replace("_otc", "")
         bot.answer_callback_query(call.id, "🔍 Анализирую...")
-        msg = bot.send_message(call.message.chat.id, "⏳ Загружаю данные...")
+        msg = bot.send_message(call.message.chat.id, "⏳ Загружаю данные (~20 сек)...")
         def analyze():
             res = portfolio_manager(ticker)
             bot.delete_message(call.message.chat.id, msg.message_id)
@@ -382,7 +413,7 @@ def handle_text(m):
     if not check_access(m): return
     ticker = m.text.strip().upper()
     if ticker.startswith('/'): return
-    msg = bot.reply_to(m, "⏳ Анализирую...")
+    msg = bot.reply_to(m, "⏳ Анализирую... (~20 сек)")
     def analyze():
         res = portfolio_manager(ticker.replace("_OTC", ""))
         bot.delete_message(m.chat.id, msg.message_id)
