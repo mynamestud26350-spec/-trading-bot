@@ -1,6 +1,6 @@
 pyTelegramBotAPI==4.16.0
 yfinance==0.2.38
-pandas==2.2.2
+pandas==2.1.4
 ta==0.10.2
 requests==2.32.3
 ccxt==4.4.41
