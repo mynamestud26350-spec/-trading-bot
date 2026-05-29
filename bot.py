@@ -1,5 +1,6 @@
 import os
 import telebot
+import yfinance as yf
 import pandas as pd
 import ta
 import requests
@@ -8,7 +9,6 @@ import ccxt
 import sqlite3
 import threading
 import logging
-import feedparser
 from datetime import datetime
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -19,7 +19,6 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "GPAKXZYJ3V37KXER")
 ALLOWED_USER_IDS = list(map(int, os.getenv("ALLOWED_USER_IDS", "").split(","))) if os.getenv("ALLOWED_USER_IDS") else []
 
 if not TOKEN:
@@ -27,29 +26,14 @@ if not TOKEN:
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("❌ BYBIT ключи не найдены")
 
-# ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
-
-# ========== ФЛАГ АВТОТОРГОВЛИ ==========
 auto_trade_active = [True]
 
-# ========== АНТИФЛУД ==========
-_user_last_request = {}
-FLOOD_TIMEOUT = 10
-
-def is_flooding(user_id):
-    now = time.time()
-    last = _user_last_request.get(user_id, 0)
-    if now - last < FLOOD_TIMEOUT:
-        return True
-    _user_last_request[user_id] = now
-    return False
-
-# ========== ЗАЩИТА ДОСТУПА ==========
+# ========== ЗАЩИТА ==========
 def is_allowed(user_id):
     if not ALLOWED_USER_IDS:
         return True
@@ -232,102 +216,54 @@ def get_cached(key):
 def set_cached(key, data):
     _cache[key] = (data, time.time())
 
-# ========== ALPHA VANTAGE — ЗАГРУЗКА ДАННЫХ ==========
-# Маппинг интервалов: наш формат -> Alpha Vantage формат
-AV_INTERVAL_MAP = {
-    '60m': '60min',
-    '30m': '30min',
-    '15m': '15min',
-    '5m':  '5min',
-    '1m':  '1min',
-}
-
+# ========== YAHOO FINANCE ==========
 def fix_ticker(ticker):
     is_otc = False
     if ticker.lower().endswith('_otc'):
         is_otc = True
         ticker = ticker[:-4]
     ticker = ticker.upper().strip()
+    if ticker in FOREX_PAIRS:
+        return f"{ticker}=X", is_otc
     return ticker, is_otc
 
-def get_data_alpha_vantage(ticker, interval):
-    """Загружает данные с Alpha Vantage. Возвращает pd.Series закрытий или None."""
-    cache_key = f"av_{ticker}_{interval}"
+def get_forex_data(ticker, interval, period_days):
+    cache_key = f"{ticker}_{interval}_{period_days}"
     cached = get_cached(cache_key)
     if cached is not None:
         return cached
-
-    av_interval = AV_INTERVAL_MAP.get(interval)
-    if not av_interval:
-        logger.warning(f"⚠️ Неизвестный интервал: {interval}")
-        return None
-
-    # Для форекс пар формируем from/to символы
-    if len(ticker) == 6 and ticker.isalpha():
-        from_sym = ticker[:3]
-        to_sym = ticker[3:]
-        url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=FX_INTRADAY"
-            f"&from_symbol={from_sym}"
-            f"&to_symbol={to_sym}"
-            f"&interval={av_interval}"
-            f"&outputsize=compact"
-            f"&apikey={ALPHA_VANTAGE_KEY}"
-        )
-    else:
-        # Для криптовалют и других активов
-        url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=CRYPTO_INTRADAY"
-            f"&symbol={ticker}"
-            f"&market=USD"
-            f"&interval={av_interval}"
-            f"&outputsize=compact"
-            f"&apikey={ALPHA_VANTAGE_KEY}"
-        )
-
     try:
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-
-        # Ключ с данными в ответе
-        time_key = None
-        for k in data.keys():
-            if 'Time Series' in k:
-                time_key = k
-                break
-
-        if not time_key:
-            logger.warning(f"⚠️ Alpha Vantage нет данных для {ticker} {interval}: {list(data.keys())}")
+        # Добавляем заголовки User-Agent, чтобы Yahoo не блокировал запросы на Render
+        data = yf.download(
+            ticker,
+            period=period_days,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        )
+        if data.empty:
+            logger.warning(f"⚠️ Нет данных для {ticker} {interval}")
             return None
-
-        ts_data = data[time_key]
-        closes = []
-        for dt_str in sorted(ts_data.keys()):
-            try:
-                close_val = float(ts_data[dt_str].get('4. close', 0))
-                closes.append(close_val)
-            except Exception:
-                continue
-
-        if len(closes) < 20:
-            logger.warning(f"⚠️ Мало данных Alpha Vantage {ticker} {interval}: {len(closes)} свечей")
+        if isinstance(data.columns, pd.MultiIndex):
+            close = data['Close'].iloc[:, 0] if 'Close' in data else data.iloc[:, 0]
+        else:
+            close = data['Close'] if 'Close' in data else data.iloc[:, 0]
+        close = close.dropna()
+        if len(close) < 20:
+            logger.warning(f"⚠️ Мало данных для {ticker} {interval}: {len(close)} свечей")
             return None
-
-        series = pd.Series(closes)
-        set_cached(cache_key, series)
-        logger.info(f"✅ Alpha Vantage: {ticker} {interval} — {len(closes)} свечей")
-        return series
-
+        set_cached(cache_key, close)
+        return close
     except Exception as e:
-        logger.error(f"❌ Ошибка Alpha Vantage {ticker} {interval}: {e}")
+        logger.error(f"❌ Ошибка загрузки данных {ticker} {interval}: {e}")
         return None
 
+# ========== АНАЛИЗ ==========
 def calculate_ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
-# ========== АНАЛИЗ ТАЙМФРЕЙМОВ ==========
 def analyze_timeframe(close, timeframe_name):
     if close is None or len(close) < 20:
         return None
@@ -364,31 +300,29 @@ def analyze_timeframe(close, timeframe_name):
         return None
 
 def multi_timeframe_analyst(ticker):
-    base_ticker, is_otc = fix_ticker(ticker)
-
-    # Alpha Vantage бесплатный план: 25 запросов/день, 5 запросов/мин
-    # Берём только 3 таймфрейма чтобы не превысить лимит
+    fixed_ticker, is_otc = fix_ticker(ticker)
     timeframes = [
-        {'name': '1H',  'interval': '60m', 'weight': 3},
-        {'name': '15M', 'interval': '15m', 'weight': 2},
-        {'name': '5M',  'interval': '5m',  'weight': 1},
+        {'name': '1H',  'interval': '60m', 'period': '7d', 'weight': 3},
+        {'name': '30M', 'interval': '30m', 'period': '5d', 'weight': 2},
+        {'name': '15M', 'interval': '15m', 'period': '3d', 'weight': 2},
+        {'name': '5M',  'interval': '5m',  'period': '2d', 'weight': 1},
+        {'name': '1M',  'interval': '1m',  'period': '1d', 'weight': 1}
     ]
-
     results = {}
     total_trend_score = 0
     total_weight = 0
 
     for tf in timeframes:
-        close = get_data_alpha_vantage(base_ticker, tf['interval'])
+        close = get_forex_data(fixed_ticker, tf['interval'], tf['period'])
         analysis = analyze_timeframe(close, tf['name'])
         if analysis:
             results[tf['name']] = analysis
             total_trend_score += analysis['trend_score'] * tf['weight']
             total_weight += tf['weight']
-        time.sleep(12)  # Alpha Vantage: макс 5 запросов в минуту на бесплатном плане
+        time.sleep(0.5)  # Небольшая пауза между запросами
 
     if not results:
-        return None, f"❌ Нет данных для {ticker}. Alpha Vantage не вернул данные.", None
+        return None, f"❌ Нет данных для {ticker}", None
 
     avg_trend = total_trend_score / total_weight if total_weight > 0 else 0
 
@@ -400,11 +334,11 @@ def multi_timeframe_analyst(ticker):
         overall_trend, overall_color = "🟡 ФЛЕТ", "🟡"
 
     signal = "⏸️ ВНЕ РЫНКА"
-    if '5M' in results:
-        m = results['5M']
-        if avg_trend > 0.3 and m['entry_score'] > 0:
+    if '1M' in results:
+        m1 = results['1M']
+        if avg_trend > 0.3 and m1['entry_score'] > 0:
             signal = "🔵 СИЛЬНЫЙ BUY"
-        elif avg_trend < -0.3 and m['entry_score'] < 0:
+        elif avg_trend < -0.3 and m1['entry_score'] < 0:
             signal = "🔴 СИЛЬНЫЙ SELL"
         elif avg_trend > 0.3:
             signal = "🟡 BUY (осторожно)"
@@ -412,7 +346,7 @@ def multi_timeframe_analyst(ticker):
             signal = "🟡 SELL (осторожно)"
 
     tf_icons = []
-    for tf_name in ['1H', '15M', '5M']:
+    for tf_name in ['1H', '30M', '15M', '5M', '1M']:
         if tf_name in results:
             r = results[tf_name]
             if "ВВЕРХ" in r['trend']:
@@ -436,56 +370,46 @@ def multi_timeframe_analyst(ticker):
         response += "\n⚠️ OTC актив — волатильность выше!"
     return results, response, signal
 
-def advanced_analysis(ticker):
-    """Расширенный анализ на основе часового таймфрейма."""
+def advanced_analysis(ticker, interval='60m'):
     try:
-        base_ticker, _ = fix_ticker(ticker)
-        close = get_data_alpha_vantage(base_ticker, '60m')
+        fixed_ticker, _ = fix_ticker(ticker)
+        close = get_forex_data(fixed_ticker, interval, '7d')
         if close is None or len(close) < 20:
             return None
 
+        # 1. Тренд по EMA50
         ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator()
         trend_slope = (float(ema50.iloc[-1]) - float(ema50.iloc[-2])) / float(ema50.iloc[-2]) * 100 if len(ema50) >= 2 else 0
         trend_val = max(0, min(100, 50 + trend_slope * 100))
         trend_signal = "BUY" if trend_val > 60 else ("SELL" if trend_val < 40 else "NEUTRAL")
 
+        # 2. RSI
         rsi_val = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
         rsi = 50 if pd.isna(rsi_val) else rsi_val
-        impulse_signal = "BUY" if rsi < 30 else ("SELL" if rsi > 70 else "NEUTRAL")
+        rsi_signal = "BUY" if rsi < 30 else ("SELL" if rsi > 70 else "NEUTRAL")
 
+        # 3. MACD
         macd = ta.trend.MACD(close).macd()
         macd_sig = ta.trend.MACD(close).macd_signal()
-        if len(macd) >= 2 and float(macd.iloc[-1]) > float(macd.iloc[-2]):
-            reversal_signal, reversal_val = "BUY", 75
-        elif len(macd) >= 2 and float(macd.iloc[-1]) < float(macd.iloc[-2]):
-            reversal_signal, reversal_val = "SELL", 25
+        if len(macd) >= 2 and macd.iloc[-1] > macd_sig.iloc[-1]:
+            macd_signal = "BUY"
+        elif len(macd) >= 2 and macd.iloc[-1] < macd_sig.iloc[-1]:
+            macd_signal = "SELL"
         else:
-            reversal_signal, reversal_val = "NEUTRAL", 50
+            macd_signal = "NEUTRAL"
 
-        ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1]
-        current_price = float(close.iloc[-1])
-        noise_val = abs((current_price - ema20) / ema20) * 100 if ema20 > 0 else 0
-        noise_signal = "LOW VOL" if noise_val < 0.3 else ("HIGH VOL" if noise_val > 1 else "NORMAL")
-
-        bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
-        bb_avg = bb.bollinger_mavg().iloc[-1]
-        bb_width = (bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1]) / bb_avg * 100 if bb_avg > 0 else 0
-        market_val = min(100, bb_width * 10)
-        market_signal = "TRENDING" if market_val > 30 else "RANGING"
-
-        scores = [trend_signal, impulse_signal, reversal_signal]
-        buy_count = sum(1 for s in scores if s == "BUY")
-        sell_count = sum(1 for s in scores if s == "SELL")
-        model_val = 50 + ((buy_count - sell_count) / len(scores)) * 50
-        model_signal = "BUY" if model_val > 60 else ("SELL" if model_val < 40 else "NEUTRAL")
+        # 4. Объём (относительный)
+        volume = close  # прокси для объёма
+        avg_vol = volume.tail(10).mean()
+        vol_ratio = (volume.iloc[-1] / avg_vol) * 100 if avg_vol > 0 else 50
+        vol_val = min(100, vol_ratio)
+        vol_signal = "BUY" if vol_val > 70 else ("SELL" if vol_val < 30 else "NEUTRAL")
 
         params = [
             ("📈 Тренд (EMA50)", trend_val, trend_signal),
-            ("⚡ Импульс (RSI)", rsi, impulse_signal),
-            ("🔄 Разворот (MACD)", reversal_val, reversal_signal),
-            ("🎛️ Шум/Фильтр", noise_val, noise_signal),
-            ("🌡️ Настр. Рынка", market_val, market_signal),
-            ("🎯 Модель", model_val, model_signal),
+            ("📊 Импульс (RSI)", rsi, rsi_signal),
+            ("🔄 Тренд (MACD)", 0, macd_signal),
+            ("📊 Объём", vol_val, vol_signal),
         ]
         buys = sum(1 for _, _, s in params if s == "BUY")
         sells = sum(1 for _, _, s in params if s == "SELL")
@@ -493,72 +417,33 @@ def advanced_analysis(ticker):
         return params, buys, sells, neutrals
 
     except Exception as e:
-        logger.error(f"❌ Ошибка advanced_analysis {ticker}: {e}")
+        logger.error(f"❌ Ошибка advanced_analysis: {e}")
         return None
 
-# ========== НОВОСТИ ==========
 def news_analyst(ticker):
-    try:
-        currency_code = ticker[:3].upper()
-        keywords_map = {
-            'EUR': ['euro', 'ecb', 'european'],
-            'USD': ['dollar', 'fed', 'federal reserve'],
-            'GBP': ['pound', 'sterling', 'boe'],
-            'JPY': ['yen', 'boj'],
-            'AUD': ['aussie', 'rba'],
-            'CAD': ['loonie', 'canada', 'boc'],
-            'CHF': ['franc', 'snb']
-        }
-        keywords = keywords_map.get(currency_code, [currency_code.lower()])
-        feed = feedparser.parse(
-            "https://www.investing.com/rss/news_FOREX.rss",
-            request_headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        if not feed.entries:
-            return "НЕЙТРАЛЬНЫЕ", "HOLD", [], 0
+    # Заглушка — можно добавить реальные новости позже
+    return "⚪ НЕЙТРАЛЬНЫЕ", "HOLD", [], 0
 
-        positive_words = ['surge', 'gain', 'rise', 'up', 'positive', 'strong', 'bullish']
-        negative_words = ['drop', 'fall', 'decline', 'down', 'negative', 'weak', 'bearish']
+def risk_manager_binary(is_otc=False):
+    if is_otc:
+        return "🟡 СРЕДНИЙ", "1% депозита"
+    return "🟢 НИЗКИЙ", "1% депозита"
 
-        news_items = []
-        for entry in feed.entries[:30]:
-            title = entry.get('title', '')
-            tl = title.lower()
-            if any(kw in tl for kw in keywords):
-                sentiment = sum(1 for w in positive_words if w in tl) - sum(1 for w in negative_words if w in tl)
-                news_items.append({'title': title[:80], 'sentiment': sentiment})
-
-        if not news_items:
-            return "НЕЙТРАЛЬНЫЕ", "HOLD", [], 0
-
-        news_items.sort(key=lambda x: abs(x['sentiment']), reverse=True)
-        top = news_items[:3]
-        total = sum(n['sentiment'] for n in top)
-
-        if total > 0:
-            return "🟢 ПОЗИТИВНЫЕ", "BUY", top, total
-        elif total < 0:
-            return "🔴 НЕГАТИВНЫЕ", "SELL", top, total
-        return "⚪ НЕЙТРАЛЬНЫЕ", "HOLD", top, total
-    except Exception as e:
-        logger.error(f"❌ Ошибка news_analyst: {e}")
-        return "⚪ НЕЙТРАЛЬНЫЕ", "HOLD", [], 0
-
-# ========== ПОРТФЕЛЬНЫЙ МЕНЕДЖЕР ==========
 def portfolio_manager(ticker):
     try:
-        _, is_otc = fix_ticker(ticker)
-
         mtf_results, mtf_analysis, mtf_signal = multi_timeframe_analyst(ticker)
         if mtf_results is None:
-            return mtf_analysis  # там уже текст ошибки
+            return mtf_analysis
 
-        # advanced_analysis использует кешированные данные из multi_timeframe_analyst
-        advanced = advanced_analysis(ticker)
-        adv_params, adv_buys, adv_sells, adv_neutrals = advanced if advanced else (None, 0, 0, 0)
+        _, is_otc = fix_ticker(ticker)
+        advanced = advanced_analysis(ticker, '60m')
+        if advanced:
+            adv_params, adv_buys, adv_sells, adv_neutrals = advanced
+        else:
+            adv_params, adv_buys, adv_sells, adv_neutrals = None, 0, 0, 0
 
-        sentiment, _, news_list, _ = news_analyst(ticker)
-        risk_level = "🟡 СРЕДНИЙ" if is_otc else "🟢 НИЗКИЙ"
+        sentiment, _, _, _ = news_analyst(ticker)
+        risk_level, risk_advice = risk_manager_binary(is_otc)
 
         if adv_params:
             if adv_buys > adv_sells + 1:
@@ -583,46 +468,47 @@ def portfolio_manager(ticker):
             else:
                 final_signal = "⏸️ ДЕРЖАТЬ"
 
-        response = f"📊 *АНАЛИЗ: {ticker.upper()}*\n{mtf_analysis}"
+        response = f"""
+📊 *КОМПЛЕКСНЫЙ АНАЛИЗ: {ticker.upper()}*
 
+*МУЛЬТИ-ТАЙМФРЕЙМ*
+{mtf_analysis}
+"""
         if adv_params:
-            sig_map = {
-                "BUY": "✅", "SELL": "❌", "NEUTRAL": "➖",
-                "LOW VOL": "💤", "HIGH VOL": "🔥", "NORMAL": "➖",
-                "TRENDING": "📈", "RANGING": "↔️"
-            }
-            response += "\n*ИНДИКАТОРЫ:*\n"
+            response += "\n*РАСШИРЕННЫЙ АНАЛИЗ:*\n"
             for name, val, sig in adv_params:
-                response += f"{sig_map.get(sig, '➖')} {name}: `{val:.1f}`\n"
-            response += f"\n✅{adv_buys} ❌{adv_sells} ➖{adv_neutrals}\n"
+                icon = "✅" if sig == "BUY" else ("❌" if sig == "SELL" else "➖")
+                response += f"{icon} {name}: {val:.1f}\n"
+            response += f"\n✅{adv_buys} ❌{adv_sells} ➖{adv_neutrals}"
 
-        response += f"\n*Новости:* {sentiment}"
-        response += f"\n*Риск:* {risk_level}"
-        response += f"\n\n🎯 *ИТОГ: {final_signal}*"
-        response += "\n\n⚠️ Не инвестрекомендация"
+        response += f"""
+*Новости:* {sentiment}
+*Риск:* {risk_level}
+
+🎯 *ИТОГ: {final_signal}*
+⚠️ Не инвестрекомендация
+"""
         if is_otc:
             response += "\n⚡ OTC — волатильность выше"
         return response
 
     except Exception as e:
-        logger.error(f"❌ Ошибка portfolio_manager {ticker}: {e}")
-        return f"❌ Ошибка анализа {ticker}. Попробуйте позже."
+        logger.error(f"❌ Ошибка portfolio_manager: {e}")
+        return f"❌ Ошибка анализа {ticker}"
 
 # ========== КРИПТО-ТРЕЙДИНГ ==========
 def get_coin_balance(symbol):
     try:
         bal = exchange.fetch_balance()
         return bal[symbol]['free'] if symbol in bal else 0
-    except Exception as e:
-        logger.error(f"❌ Баланс {symbol}: {e}")
+    except:
         return 0
 
 def get_coin_price(symbol):
     try:
         t = exchange.fetch_ticker(f'{symbol}/USDT')
         return t['last']
-    except Exception as e:
-        logger.error(f"❌ Цена {symbol}: {e}")
+    except:
         return 0
 
 def buy_coin(symbol, amount_usdt):
@@ -738,12 +624,7 @@ def handle_callback(call):
     if not check_access(call):
         bot.answer_callback_query(call.id, "⛔ Доступ запрещён.")
         return
-    uid = call.from_user.id
     data = call.data
-
-    if data.startswith("an_") and is_flooding(uid):
-        bot.answer_callback_query(call.id, "⏳ Подождите 10 сек. между запросами.", show_alert=True)
-        return
 
     if data == "close_window":
         bot.edit_message_text("✅ *Окно закрыто*\n\nОтправьте /start для открытия меню.",
@@ -821,9 +702,7 @@ def handle_callback(call):
     if data.startswith("an_"):
         ticker = data.replace("an_", "")
         bot.answer_callback_query(call.id, "🔍 Анализирую...")
-        wait_msg = bot.send_message(call.message.chat.id,
-                                    "⏳ *Анализирую...* Это займёт ~40 секунд из-за лимитов API.",
-                                    parse_mode='Markdown')
+        wait_msg = bot.send_message(call.message.chat.id, "⏳ *Анализирую...* Подождите до 20 сек.", parse_mode='Markdown')
 
         def run_analysis(t=ticker, chat_id=call.message.chat.id, wait_id=wait_msg.message_id):
             try:
@@ -835,17 +714,11 @@ def handle_callback(call):
                     telebot.types.InlineKeyboardButton("🏠 ГЛАВНОЕ МЕНЮ", callback_data="back_to_menu")
                 )
                 kb.add(telebot.types.InlineKeyboardButton("❌ Закрыть", callback_data="close_window"))
-                try:
-                    bot.delete_message(chat_id, wait_id)
-                except Exception:
-                    pass
+                bot.delete_message(chat_id, wait_id)
                 bot.send_message(chat_id, result, parse_mode='Markdown', reply_markup=kb)
             except Exception as e:
-                logger.error(f"❌ run_analysis {t}: {e}")
-                try:
-                    bot.edit_message_text("❌ Ошибка анализа. Попробуйте позже.", chat_id, wait_id)
-                except Exception:
-                    pass
+                logger.error(f"❌ run_analysis: {e}")
+                bot.edit_message_text("❌ Ошибка анализа. Попробуйте позже.", chat_id, wait_id)
 
         threading.Thread(target=run_analysis, daemon=True).start()
         return
@@ -858,27 +731,18 @@ def handle_message(message):
     ticker = message.text.strip().upper()
     if ticker.startswith('/'):
         return
-    if is_flooding(message.from_user.id):
-        bot.reply_to(message, "⏳ Подождите 10 секунд между запросами.")
-        return
-    wait_msg = bot.reply_to(message, "⏳ *Анализирую...* Это займёт ~40 секунд.", parse_mode='Markdown')
+    wait_msg = bot.reply_to(message, "⏳ *Анализирую...* Подождите до 20 сек.", parse_mode='Markdown')
 
     def run_analysis(t=ticker, chat_id=message.chat.id, wait_id=wait_msg.message_id, orig=message):
         try:
             result = portfolio_manager(t)
             kb = telebot.types.InlineKeyboardMarkup()
             kb.add(telebot.types.InlineKeyboardButton("◀ В ГЛАВНОЕ МЕНЮ", callback_data="back_to_menu"))
-            try:
-                bot.delete_message(chat_id, wait_id)
-            except Exception:
-                pass
+            bot.delete_message(chat_id, wait_id)
             bot.reply_to(orig, result, parse_mode='Markdown', reply_markup=kb)
         except Exception as e:
             logger.error(f"❌ handle_message: {e}")
-            try:
-                bot.edit_message_text("❌ Ошибка анализа.", chat_id, wait_id)
-            except Exception:
-                pass
+            bot.edit_message_text("❌ Ошибка анализа.", chat_id, wait_id)
 
     threading.Thread(target=run_analysis, daemon=True).start()
 
@@ -886,7 +750,6 @@ def handle_message(message):
 def auto_trade_loop():
     from ta.momentum import RSIIndicator
     coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]
-    settings = {c: {"rsi_buy": 30, "rsi_sell": 70, "take_profit": 3, "stop_loss": 2, "amount": 10} for c in coins}
     logger.info("🤖 АВТОТОРГОВЛЯ ЗАПУЩЕНА")
     while True:
         if not auto_trade_active[0]:
@@ -900,25 +763,24 @@ def auto_trade_loop():
                 ohlcv = exchange.fetch_ohlcv(f'{coin}/USDT', timeframe='15m', limit=100)
                 closes = [c[4] for c in ohlcv]
                 rsi = RSIIndicator(pd.Series(closes), window=14).rsi().iloc[-1]
-                cfg = settings[coin]
                 last = get_last_open_trade(coin)
                 if last is None:
-                    if rsi < cfg["rsi_buy"]:
-                        r = buy_coin(coin, cfg["amount"])
+                    if rsi < 30:
+                        r = buy_coin(coin, 10)
                         logger.info(f"🟢 АВТО-ПОКУПКА {coin} RSI={rsi:.1f} | {r}")
                         time.sleep(2)
                 else:
                     tid, qty, ep = last
                     pct = ((price - ep) / ep) * 100
-                    if pct >= cfg["take_profit"]:
+                    if pct >= 3:
                         r = sell_coin(coin, qty)
                         logger.info(f"✅ ТЕЙК {coin}: +{pct:.2f}%")
                         time.sleep(2)
-                    elif pct <= -cfg["stop_loss"]:
+                    elif pct <= -2:
                         r = sell_coin(coin, qty)
                         logger.info(f"🛑 СТОП {coin}: {pct:.2f}%")
                         time.sleep(2)
-                    elif rsi > cfg["rsi_sell"]:
+                    elif rsi > 70:
                         r = sell_coin(coin, qty)
                         logger.info(f"🔴 АВТО-ПРОДАЖА {coin} RSI={rsi:.1f}")
                         time.sleep(2)
