@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ========== НАСТРОЙКИ ==========
-TOKEN = os.getenv("TELEGRAM_TOKEN", "7852603191:AAFqFd-ylcjuJ1C_YtL62uIf9c6fOLaFpoQ")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "MsduMr47ykYJVe7ASM")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "OMDaGBGpHWMKHbrHefAOgIvZajJv7X0KIoMP")
+TOKEN = os.getenv("TELEGRAM_TOKEN", "7852603191:AAE08Eqz8WNc9UD4_ZyM8YS7GmIw1jcgad4")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "UhHGm6bB5zG90miFkG")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "3V7vA1K4hPnVvu8MkOatQGdL6xFneKD5BRHT")
 ALLOWED_USER_IDS = list(map(int, os.getenv("ALLOWED_USER_IDS", "").split(","))) if os.getenv("ALLOWED_USER_IDS") else []
 
 # ========== ЛОГИРОВАНИЕ ==========
@@ -230,36 +230,279 @@ def fix_ticker(ticker):
         return f"{ticker}=X", is_otc
     return ticker, is_otc
 
-def get_forex_price(ticker):
-    fixed, is_otc = fix_ticker(ticker)
+def calculate_ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
+
+def get_data_for_timeframe(ticker, interval, period_days):
+    cache_key = f"{ticker}_{interval}_{period_days}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
     try:
-        data = yf.download(fixed, period="2d", interval="1h", progress=False)
+        data = yf.download(ticker, period=period_days, interval=interval, progress=False)
         if data.empty:
-            return None, is_otc
+            logger.warning(f"⚠️ Нет данных для {ticker} {interval}")
+            return None
         if isinstance(data.columns, pd.MultiIndex):
             close = data['Close'].iloc[:, 0] if 'Close' in data else data.iloc[:, 0]
         else:
             close = data['Close'] if 'Close' in data else data.iloc[:, 0]
-        current = float(close.iloc[-1])
-        prev = float(close.iloc[-2]) if len(close) >= 2 else current
-        change = ((current - prev) / prev) * 100
-        return current, change, is_otc
+        close = close.dropna()
+        if len(close) < 20:
+            logger.warning(f"⚠️ Мало данных для {ticker} {interval}: {len(close)} свечей")
+            return None
+        set_cached(cache_key, close)
+        return close
     except Exception as e:
-        return None, is_otc
+        logger.error(f"❌ Ошибка загрузки данных {ticker} {interval}: {e}")
+        return None
 
-def analyze_forex(ticker):
-    price, change, is_otc = get_forex_price(ticker)
-    if price is None:
-        return f"❌ Нет данных по {ticker}"
-    result = f"""
-📊 *{ticker.upper()}*
-━━━━━━━━━━━━━━━━━━━━
-💰 *Цена:* {price:.5f}
-📈 *Изменение:* {change:+.2f}%
+def analyze_timeframe(close, timeframe_name):
+    if close is None or len(close) < 20:
+        return None
+    try:
+        current_price = float(close.iloc[-1])
+        ema50 = calculate_ema(close, 50).iloc[-1] if len(close) >= 50 else current_price
+        rsi_val = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        rsi = 50 if pd.isna(rsi_val) else rsi_val
+        if current_price > ema50 * 1.0003:
+            trend, trend_score = "📈 ВВЕРХ", 1
+        elif current_price < ema50 * 0.9997:
+            trend, trend_score = "📉 ВНИЗ", -1
+        else:
+            trend, trend_score = "➡️ ФЛЕТ", 0
+        if rsi < 30 and trend_score >= 0:
+            entry_signal, entry_score = "🚀 ПОТЕНЦИАЛЬНЫЙ BUY", 1
+        elif rsi > 70 and trend_score <= 0:
+            entry_signal, entry_score = "🚀 ПОТЕНЦИАЛЬНЫЙ SELL", -1
+        elif trend_score > 0:
+            entry_signal, entry_score = "📈 ИЩЕМ BUY", 0.5
+        elif trend_score < 0:
+            entry_signal, entry_score = "📉 ИЩЕМ SELL", -0.5
+        else:
+            entry_signal, entry_score = "⏸️ ЖДЁМ", 0
+        return {'price': current_price, 'trend': trend, 'trend_score': trend_score, 'rsi': rsi, 'entry_signal': entry_signal, 'entry_score': entry_score}
+    except Exception as e:
+        logger.error(f"❌ Ошибка анализа таймфрейма {timeframe_name}: {e}")
+        return None
+
+def multi_timeframe_analyst(ticker):
+    fixed_ticker, is_otc = fix_ticker(ticker)
+    timeframes = [
+        {'name': '1H',  'interval': '60m', 'period': '7d', 'weight': 3},
+        {'name': '30M', 'interval': '30m', 'period': '5d', 'weight': 2},
+        {'name': '15M', 'interval': '15m', 'period': '3d', 'weight': 2},
+        {'name': '5M',  'interval': '5m',  'period': '2d', 'weight': 1},
+        {'name': '1M',  'interval': '1m',  'period': '1d', 'weight': 1}
+    ]
+    results = {}
+    total_trend_score = 0
+    total_weight = 0
+    for tf in timeframes:
+        close = get_data_for_timeframe(fixed_ticker, tf['interval'], tf['period'])
+        analysis = analyze_timeframe(close, tf['name'])
+        if analysis:
+            results[tf['name']] = analysis
+            total_trend_score += analysis['trend_score'] * tf['weight']
+            total_weight += tf['weight']
+    if not results:
+        return None, "Нет данных", None
+    avg_trend = total_trend_score / total_weight if total_weight > 0 else 0
+    if avg_trend > 0.3:
+        overall_trend, overall_color = "📈 ТРЕНД ВВЕРХ", "🟢"
+    elif avg_trend < -0.3:
+        overall_trend, overall_color = "📉 ТРЕНД ВНИЗ", "🔴"
+    else:
+        overall_trend, overall_color = "🟡 ФЛЕТ", "🟡"
+    signal = "⏸️ ВНЕ РЫНКА"
+    if '1M' in results:
+        m1 = results['1M']
+        if avg_trend > 0.3 and m1['entry_score'] > 0:
+            signal = "🔵 СИЛЬНЫЙ BUY"
+        elif avg_trend < -0.3 and m1['entry_score'] < 0:
+            signal = "🔴 СИЛЬНЫЙ SELL"
+        elif avg_trend > 0.3:
+            signal = "🟡 BUY (осторожно)"
+        elif avg_trend < -0.3:
+            signal = "🟡 SELL (осторожно)"
+    tf_icons = []
+    for tf_name in ['1H', '30M', '15M', '5M', '1M']:
+        if tf_name in results:
+            r = results[tf_name]
+            if "ВВЕРХ" in r['trend']:
+                tf_icons.append(f"{tf_name}⬆️")
+            elif "ВНИЗ" in r['trend']:
+                tf_icons.append(f"{tf_name}⬇️")
+            else:
+                tf_icons.append(f"{tf_name}➡️")
+    tf_line = " ".join(tf_icons)
+    response = f"""
+{overall_color} *МУЛЬТИ-ТАЙМФРЕЙМ: {ticker.upper()}*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{tf_line}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+*ОБЩИЙ ТРЕНД:* {overall_trend}
+🎯 *СИГНАЛ:* {signal}
+⏰ Экспирация: 1-2 минуты (вход со следующей свечи)
 """
     if is_otc:
-        result += "\n⚡ *OTC* — волатильность выше!"
-    return result
+        response += "\n⚠️ OTC актив — волатильность выше!"
+    return results, response, signal
+
+def advanced_analysis(ticker, interval='60m'):
+    try:
+        fixed_ticker, _ = fix_ticker(ticker)
+        data = yf.download(fixed_ticker, period='3d', interval=interval, progress=False)
+        if data.empty:
+            logger.warning(f"⚠️ Нет данных для расширенного анализа {ticker}")
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            close = data['Close'].iloc[:, 0]
+            high = data['High'].iloc[:, 0]
+            low = data['Low'].iloc[:, 0]
+            volume = data['Volume'].iloc[:, 0]
+        else:
+            close = data['Close']
+            high = data['High']
+            low = data['Low']
+            volume = data['Volume']
+        close = close.dropna()
+        if len(close) < 20:
+            return None
+        ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator()
+        trend_slope = (float(ema50.iloc[-1]) - float(ema50.iloc[-2])) / float(ema50.iloc[-2]) * 100 if len(ema50) >= 2 else 0
+        trend_val = max(0, min(100, 50 + trend_slope * 100))
+        trend_signal = "BUY" if trend_val > 60 else ("SELL" if trend_val < 40 else "NEUTRAL")
+        avg_volume = volume.tail(10).mean()
+        vol_ratio = (float(volume.iloc[-1]) / avg_volume) * 100 if avg_volume > 0 else 50
+        vol_val = min(100, vol_ratio)
+        vol_signal = "BUY" if vol_val > 70 else ("SELL" if vol_val < 30 else "NEUTRAL")
+        macd = ta.trend.MACD(close).macd()
+        macd_signal_line = ta.trend.MACD(close).macd_signal()
+        if len(macd) >= 2 and float(macd.iloc[-1]) > float(macd.iloc[-2]) and float(macd_signal_line.iloc[-1]) < float(macd_signal_line.iloc[-2]):
+            reversal_signal, reversal_val = "BUY", 75
+        elif len(macd) >= 2 and float(macd.iloc[-1]) < float(macd.iloc[-2]) and float(macd_signal_line.iloc[-1]) > float(macd_signal_line.iloc[-2]):
+            reversal_signal, reversal_val = "SELL", 25
+        else:
+            reversal_signal, reversal_val = "NEUTRAL", 50
+        rsi_val = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        rsi = 50 if pd.isna(rsi_val) else rsi_val
+        impulse_val = rsi
+        impulse_signal = "BUY" if rsi < 30 else ("SELL" if rsi > 70 else "NEUTRAL")
+        williams = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r().iloc[-1]
+        williams = -50 if pd.isna(williams) else williams
+        pressure_val = 50 - williams
+        pressure_signal = "BUY" if williams < -80 else ("SELL" if williams > -20 else "NEUTRAL")
+        atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+        current_price = float(close.iloc[-1])
+        atr_percent = (atr / current_price) * 100 if current_price > 0 else 0
+        activity_val = min(100, atr_percent * 20)
+        activity_signal = "OVERBOUGHT" if activity_val > 80 else ("NEUTRAL" if activity_val > 30 else "OVER SOLD")
+        vpt = ta.volume.VolumePriceTrendIndicator(close, volume).volume_price_trend()
+        if len(vpt) >= 2 and vpt.iloc[-1] > vpt.iloc[-2]:
+            whale_signal, whale_val = "BUY", 70
+        elif len(vpt) >= 2:
+            whale_signal, whale_val = "SELL", 30
+        else:
+            whale_signal, whale_val = "NEUTRAL", 50
+        ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1]
+        noise_val = abs((current_price - ema20) / ema20) * 100 if ema20 > 0 else 0
+        noise_signal = "LOW VOL" if noise_val < 0.3 else ("HIGH VOL" if noise_val > 1 else "NORMAL")
+        liquidity_val = min(100, max(0, 100 - (atr_percent * 10)))
+        liquidity_signal = "BUY" if liquidity_val > 60 else ("SELL" if liquidity_val < 40 else "NEUTRAL")
+        adx_val = ta.trend.ADXIndicator(high, low, close, window=14).adx().iloc[-1]
+        direction_val = 25 if pd.isna(adx_val) else adx_val
+        direction_signal = "BUY" if direction_val > 25 else ("SELL" if direction_val < 20 else "NEUTRAL")
+        if len(high) >= 10:
+            hh = high.iloc[-1] > high.iloc[-5]
+            hl = low.iloc[-1] > low.iloc[-5]
+            if hh and hl:
+                structure_signal, structure_val = "BUY", 75
+            elif not hh and not hl:
+                structure_signal, structure_val = "SELL", 25
+            else:
+                structure_signal, structure_val = "NEUTRAL", 50
+        else:
+            structure_signal, structure_val = "NEUTRAL", 50
+        bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+        bb_avg = bb.bollinger_mavg().iloc[-1]
+        bb_width = (bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1]) / bb_avg * 100 if bb_avg > 0 else 0
+        market_val = min(100, bb_width * 10)
+        market_signal = "TRENDING" if market_val > 30 else "RANGING"
+        scores = [trend_signal, vol_signal, reversal_signal, impulse_signal, pressure_signal,
+                  whale_signal, liquidity_signal, direction_signal, structure_signal]
+        buy_count = sum(1 for s in scores if s == "BUY")
+        sell_count = sum(1 for s in scores if s == "SELL")
+        model_val = 50 + ((buy_count - sell_count) / len(scores)) * 50
+        model_signal = "BUY" if model_val > 60 else ("SELL" if model_val < 40 else "NEUTRAL")
+        params = [
+            ("📈 Тренд", trend_val, trend_signal),
+            ("📊 Объёмы", vol_val, vol_signal),
+            ("🔄 Разворот", reversal_val, reversal_signal),
+            ("⚡ Импульс", impulse_val, impulse_signal),
+            ("🏋️ Давление", pressure_val, pressure_signal),
+            ("📈 Активность", activity_val, activity_signal),
+            ("🐋 Крупная игра", whale_val, whale_signal),
+            ("🎛️ Шум/Фильтр", noise_val, noise_signal),
+            ("💧 Ликвидность", liquidity_val, liquidity_signal),
+            ("🧭 Напр. Тренда", direction_val, direction_signal),
+            ("🏗️ Структура", structure_val, structure_signal),
+            ("🌡️ Наст. Рынка", market_val, market_signal),
+            ("🎯 Модель Напр.", model_val, model_signal),
+        ]
+        buys = sum(1 for _, _, s in params if s == "BUY")
+        sells = sum(1 for _, _, s in params if s == "SELL")
+        neutrals = len(params) - buys - sells
+        return params, buys, sells, neutrals
+    except Exception as e:
+        logger.error(f"❌ Ошибка расширенного анализа {ticker}: {e}")
+        return None
+
+def news_analyst(ticker):
+    try:
+        currency_code = ticker[:3].upper()
+        rss_url = "https://www.investing.com/rss/news_FOREX.rss"
+        response = requests.get(rss_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if response.status_code != 200:
+            logger.warning(f"⚠️ RSS недоступен: статус {response.status_code}")
+            return "НЕЙТРАЛЬНЫЕ", "HOLD", "Нет данных", [], 0
+        keywords_map = {
+            'EUR': ['euro', 'ecb'], 'USD': ['dollar', 'fed'], 'GBP': ['pound'],
+            'JPY': ['yen'], 'AUD': ['aussie'], 'CAD': ['loonie'], 'CHF': ['franc']
+        }
+        keywords = keywords_map.get(currency_code, [currency_code.lower()])
+        content = response.text
+        news_items = []
+        for line in content.split('\n'):
+            if '<title>' in line:
+                title = line.replace('<title>', '').replace('</title>', '').strip()
+                title_lower = title.lower()
+                relevance = sum(1 for kw in keywords if kw in title_lower)
+                if relevance > 0:
+                    sentiment = 0
+                    for w in ['surge', 'gain', 'rise', 'up', 'positive']:
+                        if w in title_lower: sentiment += 1
+                    for w in ['drop', 'fall', 'decline', 'down', 'negative']:
+                        if w in title_lower: sentiment -= 1
+                    news_items.append({'title': title[:80], 'sentiment': sentiment})
+        if not news_items:
+            return "НЕЙТРАЛЬНЫЕ", "HOLD", "Нет новостей", [], 0
+        news_items.sort(key=lambda x: abs(x['sentiment']), reverse=True)
+        top_news = news_items[:3]
+        total = sum(n['sentiment'] for n in top_news)
+        if total > 0:
+            return "ПОЗИТИВНЫЕ", "BUY", "Новости позитивные", top_news, total
+        elif total < 0:
+            return "НЕГАТИВНЫЕ", "SELL", "Новости негативные", top_news, total
+        return "НЕЙТРАЛЬНЫЕ", "HOLD", "Новости нейтральные", top_news, total
+    except Exception as e:
+        logger.error(f"❌ Ошибка новостного анализа: {e}")
+        return "НЕЙТРАЛЬНЫЕ", "HOLD", "Ошибка", [], 0
+
+def risk_manager_binary(is_otc=False):
+    if is_otc:
+        return "🟡 СРЕДНИЙ", "Всегда только 1% депозита"
+    return "🟢 НИЗКИЙ", "Всегда только 1% депозита"
 
 # ========== КРИПТО-ТРЕЙДИНГ ==========
 def get_coin_balance(symbol):
@@ -304,6 +547,72 @@ def sell_coin(symbol, qty):
         return f"✅ Продано {qty} {symbol} по {price} USDT"
     except Exception as e:
         return f"❌ Ошибка: {e}"
+
+# ========== ПОРТФЕЛЬНЫЙ МЕНЕДЖЕР ==========
+def portfolio_manager(ticker):
+    try:
+        mtf_results, mtf_analysis, mtf_signal = multi_timeframe_analyst(ticker)
+        if mtf_results is None:
+            return f"❌ Нет данных по {ticker}"
+        _, is_otc = fix_ticker(ticker)
+        advanced = advanced_analysis(ticker, '60m')
+        if advanced:
+            adv_params, adv_buys, adv_sells, adv_neutrals = advanced
+        else:
+            adv_params, adv_buys, adv_sells, adv_neutrals = None, 0, 0, 0
+        sentiment, news_verdict, news_reason, news_list, news_score = news_analyst(ticker)
+        risk_level, risk_advice = risk_manager_binary(is_otc)
+        if adv_params:
+            if adv_buys > adv_sells + 2:
+                final_signal = "ПОКУПАТЬ"
+            elif adv_sells > adv_buys + 2:
+                final_signal = "ПРОДАВАТЬ"
+            elif adv_buys > adv_sells:
+                final_signal = "ПОКУПАТЬ (осторожно)"
+            elif adv_sells > adv_buys:
+                final_signal = "ПРОДАВАТЬ (осторожно)"
+            else:
+                final_signal = "ДЕРЖАТЬ"
+        else:
+            if "СИЛЬНЫЙ BUY" in str(mtf_signal):
+                final_signal = "ПОКУПАТЬ"
+            elif "СИЛЬНЫЙ SELL" in str(mtf_signal):
+                final_signal = "ПРОДАВАТЬ"
+            elif "BUY" in str(mtf_signal):
+                final_signal = "ПОКУПАТЬ (осторожно)"
+            elif "SELL" in str(mtf_signal):
+                final_signal = "ПРОДАВАТЬ (осторожно)"
+            else:
+                final_signal = "ДЕРЖАТЬ"
+        response = f"""
+📊 *КОМПЛЕКСНЫЙ АНАЛИЗ: {ticker.upper()}*
+*МУЛЬТИ-ТАЙМФРЕЙМ*
+{mtf_analysis}
+*РАСШИРЕННЫЙ АНАЛИЗ (13 параметров)*
+"""
+        if adv_params:
+            sig_map = {
+                "BUY": "Покупка", "SELL": "Продажа", "NEUTRAL": "Нейтрально",
+                "OVERBOUGHT": "Перекуп-ть", "OVER SOLD": "Перепрод-ть",
+                "LOW VOL": "Низк. Вол.", "HIGH VOL": "Выс. Вол.",
+                "TRENDING": "Тренд", "RANGING": "Флэт"
+            }
+            for name, val, sig in adv_params:
+                sig_text = sig_map.get(sig, str(sig)[:10])
+                response += f"\n{name} {val:.1f} {sig_text}"
+        response += f"""
+*Распределение:* BUY: {adv_buys} | SELL: {adv_sells} | NEUTRAL: {adv_neutrals}
+*Новости:* {sentiment}
+*Риск:* {risk_level}
+*ИТОГ:* {final_signal}
+⚠️ Не инвестрекомендация
+"""
+        if is_otc:
+            response += f"\n⚡ OTC — волатильность выше"
+        return response
+    except Exception as e:
+        logger.error(f"❌ Ошибка portfolio_manager: {e}")
+        return f"❌ Ошибка анализа {ticker}"
 
 # ========== МЕНЮ ==========
 def create_main_menu():
@@ -548,26 +857,6 @@ def auto_trade_loop():
 
 auto_trade_thread = threading.Thread(target=auto_trade_loop, daemon=True)
 auto_trade_thread.start()
-
-# ========== ПОРТФЕЛЬНЫЙ МЕНЕДЖЕР ==========
-def portfolio_manager(ticker):
-    try:
-        fixed, is_otc = fix_ticker(ticker)
-        price, change, _ = get_forex_price(ticker)
-        if price is None:
-            return f"❌ Нет данных по {ticker}"
-        result = f"""
-📊 *КОМПЛЕКСНЫЙ АНАЛИЗ: {ticker.upper()}*
-━━━━━━━━━━━━━━━━━━━━━━━
-💰 *Цена:* {price:.5f}
-📈 *Изменение:* {change:+.2f}%
-"""
-        if is_otc:
-            result += "\n⚡ *OTC* — волатильность выше!"
-        result += "\n━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ Не инвестрекомендация"
-        return result
-    except Exception as e:
-        return f"❌ Ошибка анализа {ticker}"
 
 # ========== WEBHOOK ==========
 def set_webhook():
