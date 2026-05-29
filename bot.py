@@ -2,7 +2,6 @@ import os
 import telebot
 import pandas as pd
 import ta
-import requests
 import time
 import ccxt
 import sqlite3
@@ -17,15 +16,12 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")
 ALLOWED_USER_IDS = list(map(int, os.getenv("ALLOWED_USER_IDS", "").split(","))) if os.getenv("ALLOWED_USER_IDS") else []
 
 if not TOKEN:
     raise ValueError("❌ TELEGRAM_TOKEN не найден")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("❌ BYBIT ключи не найдены")
-if not ALPHA_VANTAGE_KEY:
-    raise ValueError("❌ ALPHA_VANTAGE_KEY не найден")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -171,53 +167,40 @@ exchange = ccxt.bybit({
     'enableRateLimit': True,
 })
 
-# ========== ВАЛЮТНЫЕ ПАРЫ ==========
-FOREX_PAIRS = [
-    'AUDCAD', 'AUDCHF', 'AUDJPY', 'AUDUSD', 'CADCHF', 'CADJPY', 'CHFJPY',
-    'EURAUD', 'EURCAD', 'EURCHF', 'EURGBP', 'EURJPY', 'EURUSD',
-    'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPJPY', 'GBPUSD',
-    'USDCAD', 'USDCHF', 'USDJPY', 'NZDJPY'
-]
-
-OTC_PAIRS = [p + "_otc" for p in FOREX_PAIRS]
-
-# ========== ALPHA VANTAGE ==========
-INTERVAL_MAP = {
-    '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '60m': '60min'
+# ========== ВАЛЮТНЫЕ ПАРЫ через Bybit ==========
+FOREX_PAIRS = {
+    'EURUSD': 'EUR/USDT',
+    'GBPUSD': 'GBP/USDT',
+    'AUDUSD': 'AUD/USDT',
+    'USDJPY': 'USD/JPY',
+    'USDCAD': 'USDCAD',
+    'USDCHF': 'USDCHF',
+    'NZDUSD': 'NZD/USDT',
 }
 
-def get_alpha_vantage_data(ticker, interval):
-    """Получает данные с Alpha Vantage"""
-    if len(ticker) == 6 and ticker.isalpha():
-        from_sym = ticker[:3]
-        to_sym = ticker[3:]
-        url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={from_sym}&to_symbol={to_sym}&interval={INTERVAL_MAP[interval]}&outputsize=compact&apikey={ALPHA_VANTAGE_KEY}"
-    else:
-        url = f"https://www.alphavantage.co/query?function=CRYPTO_INTRADAY&symbol={ticker}&market=USD&interval={INTERVAL_MAP[interval]}&outputsize=compact&apikey={ALPHA_VANTAGE_KEY}"
-    
+def get_forex_price(ticker):
+    """Получает текущую цену валютной пары через Bybit"""
     try:
-        r = requests.get(url, timeout=15)
-        data = r.json()
-        time_key = next((k for k in data.keys() if 'Time Series' in k), None)
-        if not time_key:
-            return None
-        closes = []
-        for dt in sorted(data[time_key].keys()):
-            try:
-                closes.append(float(data[time_key][dt]['4. close']))
-            except:
-                continue
-        if len(closes) < 20:
-            return None
+        symbol = FOREX_PAIRS.get(ticker, ticker.replace("=", "/"))
+        ticker_data = exchange.fetch_ticker(f'{symbol}')
+        return ticker_data['last']
+    except:
+        return None
+
+def get_forex_history(ticker, timeframe='15m', limit=100):
+    """Получает историю цен для валютной пары"""
+    try:
+        symbol = FOREX_PAIRS.get(ticker, ticker.replace("=", "/"))
+        ohlcv = exchange.fetch_ohlcv(f'{symbol}', timeframe=timeframe, limit=limit)
+        closes = [c[4] for c in ohlcv]
         return pd.Series(closes)
-    except Exception as e:
-        logger.error(f"Alpha Vantage ошибка {ticker}: {e}")
+    except:
         return None
 
 def calculate_ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
-def analyze_timeframe(close, name):
+def analyze_series(close):
     if close is None or len(close) < 20:
         return None
     current = close.iloc[-1]
@@ -229,69 +212,27 @@ def analyze_timeframe(close, name):
         trend, ts = "📉 ВНИЗ", -1
     else:
         trend, ts = "➡️ ФЛЕТ", 0
-    if rsi < 30 and ts >= 0:
-        entry, es = "🚀 ПОТЕНЦИАЛЬНЫЙ BUY", 1
-    elif rsi > 70 and ts <= 0:
-        entry, es = "🚀 ПОТЕНЦИАЛЬНЫЙ SELL", -1
-    elif ts > 0:
-        entry, es = "📈 ИЩЕМ BUY", 0.5
-    elif ts < 0:
-        entry, es = "📉 ИЩЕМ SELL", -0.5
-    else:
-        entry, es = "⏸️ ЖДЁМ", 0
-    return {'price': current, 'trend': trend, 'ts': ts, 'rsi': rsi, 'entry': entry, 'es': es}
-
-def multi_timeframe_analyst(ticker):
-    results = {}
-    total_ts = 0
-    total_w = 0
-    timeframes = [
-        ('1H', '60m', 3, 7), ('30M', '30m', 2, 5), ('15M', '15m', 2, 3),
-        ('5M', '5m', 1, 2), ('1M', '1m', 1, 1)
-    ]
-    for name, iv, weight, days in timeframes:
-        close = get_alpha_vantage_data(ticker, iv)
-        if close is None:
-            continue
-        a = analyze_timeframe(close, name)
-        if a:
-            results[name] = a
-            total_ts += a['ts'] * weight
-            total_w += weight
-        time.sleep(12)
-    if not results:
-        return None, "❌ Нет данных", None
-    avg = total_ts / total_w
-    if avg > 0.3:
-        overall, color = "📈 ТРЕНД ВВЕРХ", "🟢"
-    elif avg < -0.3:
-        overall, color = "📉 ТРЕНД ВНИЗ", "🔴"
-    else:
-        overall, color = "🟡 ФЛЕТ", "🟡"
-    signal = "⏸️ ВНЕ РЫНКА"
-    if '1M' in results and results['1M']['es'] != 0:
-        if avg > 0.3 and results['1M']['es'] > 0:
-            signal = "🔵 СИЛЬНЫЙ BUY"
-        elif avg < -0.3 and results['1M']['es'] < 0:
-            signal = "🔴 СИЛЬНЫЙ SELL"
-    icons = []
-    for tf in ['1H', '30M', '15M', '5M', '1M']:
-        if tf in results:
-            icons.append(f"{tf}⬆️" if "ВВЕРХ" in results[tf]['trend'] else f"{tf}⬇️" if "ВНИЗ" in results[tf]['trend'] else f"{tf}➡️")
-    response = f"""
-{color} *МУЛЬТИ-ТАЙМФРЕЙМ: {ticker}*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{' '.join(icons)}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-*ОБЩИЙ ТРЕНД:* {overall}
-🎯 *СИГНАЛ:* {signal}
-⏰ Экспирация: 1-2 минуты
-"""
-    return results, response, signal
+    return {'price': current, 'trend': trend, 'ts': ts, 'rsi': rsi}
 
 def portfolio_manager(ticker):
-    _, resp, _ = multi_timeframe_analyst(ticker)
-    return resp if resp else f"❌ Нет данных для {ticker}"
+    try:
+        close = get_forex_history(ticker, '30m', 100)
+        if close is None:
+            return f"❌ Нет данных для {ticker}"
+        analysis = analyze_series(close)
+        if analysis is None:
+            return f"❌ Ошибка анализа {ticker}"
+        return f"""
+📊 *АНАЛИЗ: {ticker}*
+━━━━━━━━━━━━━━━━━━━━━━━
+💰 *Цена:* {analysis['price']:.5f}
+📈 *Тренд:* {analysis['trend']}
+📉 *RSI:* {analysis['rsi']:.1f}
+━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ Не инвестрекомендация
+"""
+    except Exception as e:
+        return f"❌ Ошибка анализа {ticker}: {e}"
 
 # ========== КРИПТО-ТРЕЙДИНГ ==========
 def get_coin_balance(symbol):
@@ -316,7 +257,7 @@ def buy_coin(symbol, amount):
         qty = round(amount / price, 5)
         exchange.create_market_buy_order(f'{symbol}/USDT', qty)
         save_trade(symbol, "buy", amount, price, qty, "open")
-        return f"✅ Куплено {qty} {symbol} по {price}"
+        return f"✅ Куплено {qty} {symbol} по {price} USDT"
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
@@ -334,8 +275,8 @@ def sell_coin(symbol, qty):
             update_trade_pnl(tid, pnl, pct)
             return f"✅ Продано {qty} {symbol} | P&L: {pnl:.2f} ({pct:.2f}%)"
         return f"✅ Продано {qty} {symbol}"
-    except:
-        return "❌ Ошибка продажи"
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
 
 # ========== МЕНЮ ==========
 def create_main_menu():
@@ -366,7 +307,7 @@ def create_coin_menu(coin, sym):
     return kb, f"📊 *{coin} ({sym})*"
 
 def create_category_menu(category):
-    pairs = FOREX_PAIRS if category == "forex" else OTC_PAIRS
+    pairs = list(FOREX_PAIRS.keys()) if category == "forex" else [p + "_otc" for p in FOREX_PAIRS.keys()]
     title = "💰 ВАЛЮТНЫЕ ПАРЫ" if category == "forex" else "⚡ OTC ПАРЫ (⚠️ волатильность)"
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     for p in pairs:
@@ -385,7 +326,7 @@ def send_menu(m):
 
 @bot.message_handler(commands=['test'])
 def test(m):
-    bot.reply_to(m, "✅ Бот работает, Alpha Vantage подключён. Попробуй выбрать валютную пару.")
+    bot.reply_to(m, "✅ Бот работает через Bybit API. Выбери валютную пару.")
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -424,14 +365,14 @@ def handle_callback(call):
         bot.send_message(call.message.chat.id, f"🤖 *Автоторговля {sym}*\nАктивна. Параметры: RSI<30 BUY, RSI>70 SELL", parse_mode='Markdown')
         return
     if data.startswith("an_"):
-        ticker = data.replace("an_", "")
+        ticker = data.replace("an_", "").replace("_otc", "")
         bot.answer_callback_query(call.id, "🔍 Анализирую...")
-        msg = bot.send_message(call.message.chat.id, "⏳ Загружаю данные (~30 сек)...")
+        msg = bot.send_message(call.message.chat.id, "⏳ Загружаю данные...")
         def analyze():
             res = portfolio_manager(ticker)
             bot.delete_message(call.message.chat.id, msg.message_id)
             kb = telebot.types.InlineKeyboardMarkup()
-            kb.add(telebot.types.InlineKeyboardButton("◀ НАЗАД К ПАРАМ", callback_data="menu_forex" if "_otc" not in ticker else "menu_forex_otc"))
+            kb.add(telebot.types.InlineKeyboardButton("◀ НАЗАД К ПАРАМ", callback_data="menu_forex" if "_otc" not in call.data else "menu_forex_otc"))
             bot.send_message(call.message.chat.id, res, parse_mode='Markdown', reply_markup=kb)
         threading.Thread(target=analyze).start()
         return
@@ -441,9 +382,9 @@ def handle_text(m):
     if not check_access(m): return
     ticker = m.text.strip().upper()
     if ticker.startswith('/'): return
-    msg = bot.reply_to(m, "⏳ Анализирую... (~30 сек)")
+    msg = bot.reply_to(m, "⏳ Анализирую...")
     def analyze():
-        res = portfolio_manager(ticker)
+        res = portfolio_manager(ticker.replace("_OTC", ""))
         bot.delete_message(m.chat.id, msg.message_id)
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("◀ В ГЛАВНОЕ МЕНЮ", callback_data="back_to_menu"))
