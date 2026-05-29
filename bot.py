@@ -1,5 +1,6 @@
 import os
 import telebot
+import yfinance as yf
 import pandas as pd
 import ta
 import requests
@@ -17,15 +18,10 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 ALLOWED_USER_IDS = list(map(int, os.getenv("ALLOWED_USER_IDS", "").split(","))) if os.getenv("ALLOWED_USER_IDS") else []
 
 if not TOKEN:
     raise ValueError("❌ TELEGRAM_TOKEN не найден")
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise ValueError("❌ BYBIT ключи не найдены")
-if not TWELVEDATA_API_KEY:
-    raise ValueError("❌ TWELVEDATA_API_KEY не найден")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -46,7 +42,6 @@ def check_access(call_or_message):
         return False
     return True
 
-# ========== БАЗА ДАННЫХ ==========
 DB_PATH = 'trades.db'
 
 def get_conn():
@@ -80,8 +75,8 @@ def save_trade(ticker, side, amount_usdt, price, qty, status="open"):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (datetime.now().isoformat(), ticker, side, amount_usdt, price, qty, 0, 0, status))
         conn.commit()
-    except Exception as e:
-        logger.error(f"❌ Ошибка сохранения сделки: {e}")
+    except:
+        pass
     finally:
         conn.close()
 
@@ -91,8 +86,8 @@ def update_trade_pnl(trade_id, pnl, pnl_percent):
         cursor = conn.cursor()
         cursor.execute('UPDATE trades SET pnl=?, pnl_percent=?, status="closed" WHERE id=?', (pnl, pnl_percent, trade_id))
         conn.commit()
-    except Exception as e:
-        logger.error(f"❌ Ошибка обновления сделки: {e}")
+    except:
+        pass
     finally:
         conn.close()
 
@@ -136,7 +131,7 @@ def get_daily_report():
 ━━━━━━━━━━━━━━━━━━━━━━━
 ⚠️ Не инвестрекомендация
 """
-    except Exception as e:
+    except:
         return "❌ Ошибка отчёта"
     finally:
         conn.close()
@@ -163,109 +158,95 @@ def get_all_trades():
 
 init_db()
 
-# ========== BYBIT ==========
-exchange = ccxt.bybit({
-    'apiKey': BYBIT_API_KEY,
-    'secret': BYBIT_API_SECRET,
-    'options': {'defaultType': 'spot'},
-    'enableRateLimit': True,
-})
+# ========== BYBIT (крипто) ==========
+if BYBIT_API_KEY and BYBIT_API_SECRET:
+    exchange = ccxt.bybit({
+        'apiKey': BYBIT_API_KEY,
+        'secret': BYBIT_API_SECRET,
+        'options': {'defaultType': 'spot'},
+        'enableRateLimit': True,
+    })
+else:
+    exchange = None
+    logger.warning("⚠️ Bybit не настроен")
 
-# ========== TWELVE DATA ==========
-def get_twelvedata_candles(symbol, interval, count=100):
-    """Получает исторические данные с Twelve Data"""
-    interval_map = {
-        '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '60m': '1h'
-    }
-    td_interval = interval_map.get(interval, '15min')
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={td_interval}&outputsize={count}&apikey={TWELVEDATA_API_KEY}"
+# ========== ВАЛЮТНЫЕ ПАРЫ ==========
+FOREX_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCAD", "USDCHF", "NZDUSD"]
+
+def get_forex_price_investing(pair):
+    """Получает цену с Investing.com через RSS"""
     try:
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-        if "values" not in data:
+        url = f"https://www.investing.com/rss/news_{pair}.rss"
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if response.status_code != 200:
             return None
-        closes = [float(v['close']) for v in data['values']]
-        if len(closes) < 20:
-            return None
-        return pd.Series(closes[::-1])  # переворачиваем для правильного порядка
-    except Exception as e:
-        logger.error(f"Twelve Data ошибка {symbol}: {e}")
+        # Ищем цену в тексте RSS
+        content = response.text
+        import re
+        # Простой поиск числа с точкой
+        match = re.search(r'\d+\.\d+', content)
+        if match:
+            return float(match.group())
+        return None
+    except:
         return None
 
-def calculate_ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
-
-def analyze_series(close):
-    if close is None or len(close) < 20:
+def get_forex_data_yahoo(pair):
+    """Получает данные с Yahoo Finance (упрощённо)"""
+    try:
+        ticker = f"{pair}=X"
+        data = yf.download(ticker, period="5d", interval="15m", progress=False, auto_adjust=False)
+        if data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            close = data['Close'].iloc[:, 0] if 'Close' in data else data.iloc[:, 0]
+        else:
+            close = data['Close'] if 'Close' in data else data.iloc[:, 0]
+        close = close.dropna()
+        if len(close) < 20:
+            return None
+        return close
+    except:
         return None
-    current = close.iloc[-1]
-    ema50 = calculate_ema(close, 50).iloc[-1] if len(close) >= 50 else current
-    rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1] or 50
-    if current > ema50 * 1.0003:
-        trend, ts = "📈 ВВЕРХ", 1
-    elif current < ema50 * 0.9997:
-        trend, ts = "📉 ВНИЗ", -1
-    else:
-        trend, ts = "➡️ ФЛЕТ", 0
-    return {'price': current, 'trend': trend, 'ts': ts, 'rsi': rsi}
 
-def multi_timeframe_analyst(ticker):
-    results = {}
-    total_ts = 0
-    total_w = 0
-    timeframes = [
-        ('1H', '60m', 3), ('30M', '30m', 2), ('15M', '15m', 2),
-        ('5M', '5m', 1), ('1M', '1m', 1)
-    ]
-    for name, interval, weight in timeframes:
-        close = get_twelvedata_candles(ticker, interval, 100)
+def analyze_pair(pair):
+    """Упрощённый анализ валютной пары"""
+    try:
+        close = get_forex_data_yahoo(pair)
         if close is None:
-            continue
-        a = analyze_series(close)
-        if a:
-            results[name] = a
-            total_ts += a['ts'] * weight
-            total_w += weight
-        time.sleep(0.5)
-    if not results:
-        return None, f"❌ Нет данных для {ticker}", None
-    avg = total_ts / total_w
-    if avg > 0.3:
-        overall, color = "📈 ТРЕНД ВВЕРХ", "🟢"
-    elif avg < -0.3:
-        overall, color = "📉 ТРЕНД ВНИЗ", "🔴"
-    else:
-        overall, color = "🟡 ФЛЕТ", "🟡"
-    signal = "⏸️ ВНЕ РЫНКА"
-    if '1M' in results:
-        if avg > 0.3 and results['1M']['ts'] > 0:
-            signal = "🔵 СИЛЬНЫЙ BUY"
-        elif avg < -0.3 and results['1M']['ts'] < 0:
-            signal = "🔴 СИЛЬНЫЙ SELL"
-    icons = []
-    for tf in ['1H', '30M', '15M', '5M', '1M']:
-        if tf in results:
-            icons.append(f"{tf}⬆️" if "ВВЕРХ" in results[tf]['trend'] else f"{tf}⬇️" if "ВНИЗ" in results[tf]['trend'] else f"{tf}➡️")
-    response = f"""
-{color} *МУЛЬТИ-ТАЙМФРЕЙМ: {ticker}*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{' '.join(icons)}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-*ОБЩИЙ ТРЕНД:* {overall}
-🎯 *СИГНАЛ:* {signal}
-⏰ Экспирация: 1-2 минуты (вход со следующей свечи)
-"""
-    return results, response, signal
+            return f"❌ Нет данных для {pair}"
+        
+        current = float(close.iloc[-1])
+        prev = float(close.iloc[-2]) if len(close) >= 2 else current
+        change = ((current - prev) / prev) * 100
+        
+        rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1] or 50
+        
+        if rsi < 30:
+            signal = "🟢 ПОКУПАТЬ (BUY)"
+        elif rsi > 70:
+            signal = "🔴 ПРОДАВАТЬ (SELL)"
+        else:
+            signal = "⚪ ДЕРЖАТЬ (HOLD)"
+        
+        return f"""
+📊 *АНАЛИЗ: {pair}*
+━━━━━━━━━━━━━━━━━━━━━━━
+💰 *Цена:* {current:.5f}
+📈 *Изменение:* {change:+.2f}%
+📉 *RSI (14):* {rsi:.1f}
 
-def portfolio_manager(ticker):
-    try:
-        _, resp, _ = multi_timeframe_analyst(ticker)
-        return resp if resp else f"❌ Нет данных для {ticker}"
+🎯 *Сигнал:* {signal}
+━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ Не инвестрекомендация
+"""
     except Exception as e:
-        return f"❌ Ошибка анализа {ticker}: {e}"
+        return f"❌ Ошибка анализа {pair}: {e}"
 
 # ========== КРИПТО-ТРЕЙДИНГ ==========
 def get_coin_balance(symbol):
+    if not exchange:
+        return 0
     try:
         bal = exchange.fetch_balance()
         return bal[symbol]['free'] if symbol in bal else 0
@@ -273,6 +254,8 @@ def get_coin_balance(symbol):
         return 0
 
 def get_coin_price(symbol):
+    if not exchange:
+        return 0
     try:
         t = exchange.fetch_ticker(f'{symbol}/USDT')
         return t['last']
@@ -280,6 +263,8 @@ def get_coin_price(symbol):
         return 0
 
 def buy_coin(symbol, amount):
+    if not exchange:
+        return "❌ Bybit не настроен"
     try:
         price = get_coin_price(symbol)
         if price == 0:
@@ -292,6 +277,8 @@ def buy_coin(symbol, amount):
         return f"❌ Ошибка: {e}"
 
 def sell_coin(symbol, qty):
+    if not exchange:
+        return "❌ Bybit не настроен"
     try:
         price = get_coin_price(symbol)
         if price == 0:
@@ -337,8 +324,7 @@ def create_coin_menu(coin, sym):
     return kb, f"📊 *{coin} ({sym})*"
 
 def create_category_menu(category):
-    forex_list = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "USDCAD", "USDCHF", "NZDUSD"]
-    pairs = forex_list if category == "forex" else [p + "_otc" for p in forex_list]
+    pairs = FOREX_PAIRS if category == "forex" else [p + "_otc" for p in FOREX_PAIRS]
     title = "💰 ВАЛЮТНЫЕ ПАРЫ" if category == "forex" else "⚡ OTC ПАРЫ (⚠️ волатильность)"
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     for p in pairs:
@@ -357,7 +343,7 @@ def send_menu(m):
 
 @bot.message_handler(commands=['test'])
 def test(m):
-    bot.reply_to(m, "✅ Бот работает через Twelve Data API. Выбери валютную пару.")
+    bot.reply_to(m, "✅ Бот работает! Выбери валютную пару.")
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -398,9 +384,9 @@ def handle_callback(call):
     if data.startswith("an_"):
         ticker = data.replace("an_", "").replace("_otc", "")
         bot.answer_callback_query(call.id, "🔍 Анализирую...")
-        msg = bot.send_message(call.message.chat.id, "⏳ Загружаю данные (~20 сек)...")
+        msg = bot.send_message(call.message.chat.id, "⏳ Загружаю данные...")
         def analyze():
-            res = portfolio_manager(ticker)
+            res = analyze_pair(ticker)
             bot.delete_message(call.message.chat.id, msg.message_id)
             kb = telebot.types.InlineKeyboardMarkup()
             kb.add(telebot.types.InlineKeyboardButton("◀ НАЗАД К ПАРАМ", callback_data="menu_forex" if "_otc" not in call.data else "menu_forex_otc"))
@@ -413,14 +399,57 @@ def handle_text(m):
     if not check_access(m): return
     ticker = m.text.strip().upper()
     if ticker.startswith('/'): return
-    msg = bot.reply_to(m, "⏳ Анализирую... (~20 сек)")
+    msg = bot.reply_to(m, "⏳ Анализирую...")
     def analyze():
-        res = portfolio_manager(ticker.replace("_OTC", ""))
+        res = analyze_pair(ticker.replace("_OTC", ""))
         bot.delete_message(m.chat.id, msg.message_id)
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("◀ В ГЛАВНОЕ МЕНЮ", callback_data="back_to_menu"))
         bot.reply_to(m, res, parse_mode='Markdown', reply_markup=kb)
     threading.Thread(target=analyze).start()
+
+def auto_trade_loop():
+    if not exchange:
+        return
+    from ta.momentum import RSIIndicator
+    coins = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]
+    logger.info("🤖 АВТОТОРГОВЛЯ ЗАПУЩЕНА")
+    while True:
+        if not auto_trade_active[0]:
+            time.sleep(10)
+            continue
+        for coin in coins:
+            try:
+                price = get_coin_price(coin)
+                if price == 0:
+                    continue
+                ohlcv = exchange.fetch_ohlcv(f'{coin}/USDT', timeframe='15m', limit=100)
+                closes = [c[4] for c in ohlcv]
+                rsi = RSIIndicator(pd.Series(closes), window=14).rsi().iloc[-1]
+                last = get_last_open_trade(coin)
+                if last is None:
+                    if rsi < 30:
+                        buy_coin(coin, 10)
+                        logger.info(f"🟢 АВТО-ПОКУПКА {coin} RSI={rsi:.1f}")
+                        time.sleep(2)
+                else:
+                    tid, qty, ep = last
+                    pct = ((price - ep) / ep) * 100
+                    if pct >= 3 or rsi > 70:
+                        sell_coin(coin, qty)
+                        logger.info(f"🔴 АВТО-ПРОДАЖА {coin} RSI={rsi:.1f} | P&L: {pct:.2f}%")
+                        time.sleep(2)
+                    elif pct <= -2:
+                        sell_coin(coin, qty)
+                        logger.info(f"🛑 СТОП-ЛОСС {coin}: {pct:.2f}%")
+                        time.sleep(2)
+            except Exception as e:
+                logger.error(f"⚠️ Автоторговля {coin}: {e}")
+            time.sleep(1)
+        time.sleep(60)
+
+if exchange:
+    threading.Thread(target=auto_trade_loop, daemon=True).start()
 
 def set_webhook():
     url = os.environ.get('RENDER_EXTERNAL_URL', '')
