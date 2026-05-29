@@ -746,6 +746,18 @@ def handle_message(message):
 
     threading.Thread(target=run_analysis, daemon=True).start()
 
+@bot.message_handler(commands=['test'])
+def test_yahoo(message):
+    try:
+        import yfinance as yf
+        data = yf.download("EURUSD=X", period="1d", interval="5m", progress=False)
+        if data.empty:
+            bot.reply_to(message, "❌ Yahoo Finance не работает на сервере (данные пустые)")
+        else:
+            price = data['Close'].iloc[-1]
+            bot.reply_to(message, f"✅ Yahoo Finance работает! Цена EURUSD: {price:.5f}")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка Yahoo Finance: {e}")
 # ========== АВТОТОРГОВЛЯ ==========
 def auto_trade_loop():
     from ta.momentum import RSIIndicator
